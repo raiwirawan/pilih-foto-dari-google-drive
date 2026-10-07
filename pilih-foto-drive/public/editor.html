@@ -13,7 +13,21 @@
     #detailPanel { display: none; }
     
     @media (min-width: 1024px) {
-      body.view-mode #listPanel { display: block; width: 350px; flex-shrink: 0; border-right: 1px solid var(--color-border); padding-right: var(--space-4); }
+      body.view-mode #listPanel { 
+        display: block; 
+        width: 350px; 
+        flex-shrink: 0; 
+        border-right: 1px solid var(--color-border); 
+        padding-right: var(--space-4); 
+        position: sticky;
+        top: 24px;
+        max-height: calc(100vh - 48px);
+        overflow-y: auto;
+      }
+      /* Sembunyikan scrollbar bawaan agar rapi */
+      body.view-mode #listPanel::-webkit-scrollbar { width: 4px; }
+      body.view-mode #listPanel::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+
       body.view-mode #main { display: flex; gap: var(--space-4); align-items: flex-start; }
       body.view-mode #detailPanel { flex: 1; min-width: 0; }
       .back-btn { display: none !important; }
