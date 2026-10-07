@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Pilih Foto untuk Diedit</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="header-section">
+    <div class="container">
+      <div style="display: flex; flex-direction: column; gap: var(--space-3);">
+        <div>
+          <h1 id="title">Memuat...</h1>
+          <p class="text-muted" style="margin-bottom: 0;">Ketuk foto yang ingin diedit. Pilihan tersimpan otomatis.</p>
+        </div>
+        <div style="display: flex;">
+          <button class="btn btn-header" onclick="logout()">Keluar</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="container" id="resultBanner" style="display: none; margin-top: var(--space-4); margin-bottom: 16px;">
+    <div style="background: rgba(37, 211, 102, 0.1); border: 1px solid rgba(37, 211, 102, 0.3); color: #4ade80; padding: 16px; border-radius: 12px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+      <div style="display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px;">
+        <span style="font-size: 20px;">🎉</span> Foto hasil edit sudah tersedia!
+      </div>
+      <a href="/result.html" class="btn btn-primary" style="background: #25D366; border-color: #25D366; color: #111; font-weight: 700; white-space: nowrap; flex-shrink: 0;">Lihat Hasil Edit</a>
+    </div>
+  </div>
+
+  <div class="container" id="bannerContainer" style="display: none;">
+    <div class="banner" id="bannerContent"></div>
+  </div>
+
+  <div class="container">
+    <div id="status" class="text-muted mb-4" role="status">Memuat data foto...</div>
+  </div>
+
+  <!-- Grid -->
+  <main class="container--wide photo-grid" id="grid"></main>
+
+  <!-- Bottom Bar -->
+  <div class="bottom-bar">
+    <div class="bottom-bar-title">
+      <span id="count" aria-live="polite">0 foto dipilih</span>
+      <div class="bottom-bar-progress" id="progressWrap" style="display: none;"><div class="bottom-bar-progress-fill" id="progressFill"></div></div>
+    </div>
+    <div class="bottom-bar-actions">
+      <button class="btn btn-outline" id="allBtn">Pilih semua</button>
+      <button class="btn btn-outline" id="resetBtn">Hapus pilihan</button>
+      <button class="btn btn-primary" id="sendBtn" disabled>Kirim ke editor</button>
+    </div>
+  </div>
+
+  <!-- Lightbox -->
+  <div id="lb" class="lightbox" role="dialog" aria-modal="true" aria-label="Pratinjau foto">
+    <div class="lightbox-header">
+      <button class="lightbox-nav" style="position: static; transform: none; background: transparent;" id="closeBtn" aria-label="Tutup">✕</button>
+    </div>
+    <div class="lightbox-content" id="lbContent">
+      <button class="lightbox-nav lightbox-prev" id="prevBtn" aria-label="Foto sebelumnya">‹</button>
+      <img id="lbimg" class="lightbox-img" alt="">
+      <button class="lightbox-nav lightbox-next" id="nextBtn" aria-label="Foto berikutnya">›</button>
+    </div>
+    <div class="lightbox-footer">
+      <span id="lbname" style="font-weight: 600;"></span>
+      <button class="btn btn-primary" id="lbselBtn"></button>
+    </div>
+  </div>
+
+  <!-- Dialog Submit -->
+  <dialog id="dlg">
+    <div id="dlgForm">
+      <h2>Kirim Pilihan ke Editor</h2>
+      <p class="text-muted" style="font-size: 14px;">Kamu memilih <span id="dlgCount" style="font-weight:bold; color:var(--color-text);"></span> foto.</p>
+      <textarea id="note" placeholder="Catatan tambahan untuk editor (opsional)..."></textarea>
+      <div style="display: flex; gap: var(--space-2); justify-content: flex-end; flex-wrap: wrap;">
+        <button class="btn btn-outline" id="closeDlgBtn">Batal</button>
+        <button class="btn btn-primary" id="confirmSubmitBtn">Kirim Sekarang</button>
+      </div>
+    </div>
+    <div id="dlgSuccess" style="display: none; text-align: center;">
+      <h2>Berhasil Terkirim! 🎉</h2>
+      <p class="text-muted" style="margin-bottom: 24px;">Pilihan kamu sudah dikunci. Beri tahu editor agar pesanan segera diproses.</p>
+      <a href="#" id="waBtn" target="_blank" class="btn btn-primary" style="background: #25D366; border-color: #25D366; color: white; width: 100%; display: none; align-items: center; justify-content: center;">
+        💬 Hubungi Editor via WhatsApp
+      </a>
+      <button class="btn btn-outline" style="margin-top: 16px; width: 100%;" onclick="$('dlg').close();">Tutup</button>
+    </div>
+  </dialog>
+
+  <script src="/shared.js"></script>
+  <script>
+    let user = null, photos = [], sel = new Set(), cur = 0, statusData = { status: 'draft', note: '' };
+    let maxSelect = 0, isLocked = false, saveTimeout = null;
+    let observer = null;
+
+    const $ = id => document.getElementById(id);
+    
+    async function init() {
+      try {
+        const uRes = await fetch('/api/me');
+        if (!uRes.ok) throw new Error('Unauthorized');
+        user = await uRes.json();
+        if (user.role !== 'client') return window.location.href = '/editor.html';
+        
+        $('title').textContent = user.name;
+        maxSelect = user.maxSelect || 0;
+        
+        if (user.resultFolderId) {
+           $('resultBanner').style.display = 'block';
+        }
+        
+        const [pRes, sRes] = await Promise.all([fetch('/api/photos'), fetch('/api/selection')]);
+        
+        if (!pRes.ok) {
+           const d = await pRes.json();
+           throw new Error(d.error || 'Gagal memuat foto');
+        }
+        photos = await pRes.json();
+        
+        if (sRes.ok) {
+          statusData = await sRes.json();
+          sel = new Set(statusData.ids || []);
+        }
+
+        checkStatus();
+        renderSkeleton();
+        $('status').textContent = photos.length ? `${photos.length} foto ditemukan.` : 'Belum ada foto di folder ini.';
+      } catch (err) {
+        if (err.message === 'Unauthorized') window.location.href = '/login.html';
+        $('status').textContent = err.message;
+      }
+    }
+
+    async function logout() {
+      await fetch('/api/logout', { method: 'POST' });
+      window.location.href = '/login.html';
+    }
+
+    function checkStatus() {
+      isLocked = statusData.status === 'submitted';
+      const bC = $('bannerContainer');
+      const bText = $('bannerContent');
+      let overLimit = false;
+
+      if (maxSelect && sel.size > maxSelect && !isLocked) {
+         overLimit = true;
+         bC.style.display = 'block';
+         bText.className = 'banner locked';
+         bText.innerHTML = `<span>⚠️ Batas diubah menjadi ${maxSelect}. Kurangi ${sel.size - maxSelect} foto sebelum mengirim.</span>`;
+      } else if (isLocked) {
+        bC.style.display = 'block';
+        bText.className = 'banner locked';
+        const d = new Date(statusData.submittedAt).toLocaleString('id-ID');
+        bText.innerHTML = `<span>🔒 Pilihan terkirim (${d}) dan saat ini dikunci. Hubungi editor untuk mengubah.</span>`;
+        $('note').value = statusData.note || '';
+      } else if (statusData.status === 'reopened') {
+        bC.style.display = 'block';
+        bText.className = 'banner';
+        bText.innerHTML = `<span>✨ Editor telah membuka kembali akses. Kamu bisa mengubah dan mengirim ulang.</span>`;
+      } else {
+        bC.style.display = 'none';
+      }
+
+      $('allBtn').style.display = (maxSelect && photos.length > maxSelect) ? 'none' : 'inline-flex';
+      $('allBtn').disabled = isLocked || overLimit;
+      $('resetBtn').disabled = isLocked;
+      $('sendBtn').disabled = isLocked || sel.size === 0 || overLimit;
+      
+      if (maxSelect) {
+        $('progressWrap').style.display = 'block';
+        $('count').textContent = `${sel.size} / ${maxSelect} foto dipilih`;
+        $('progressFill').style.width = Math.min((sel.size / maxSelect) * 100, 100) + '%';
+        if (sel.size > maxSelect) $('progressFill').style.background = '#D31510';
+        else $('progressFill').style.background = 'var(--color-accent-blue)';
+      } else {
+        $('progressWrap').style.display = 'none';
+        $('count').textContent = `${sel.size} foto dipilih`;
+      }
+    }
+
+    function forceSave() {
+      clearTimeout(saveTimeout);
+      statusData.ids = [...sel];
+      return fetch('/api/selection', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ ids: statusData.ids, note: statusData.note })
+      }).catch(e => console.error(e));
+    }
+
+    function autoSave() {
+      if (isLocked) return;
+      clearTimeout(saveTimeout);
+      statusData.ids = [...sel];
+      saveTimeout = setTimeout(() => forceSave(), 500);
+    }
+
+    const thumbUrl = (p) => `/api/thumb/${p.id}?w=400`;
+    const fullUrl = (p) => `/api/thumb/${p.id}?w=1600`;
+
+    function renderSkeleton() {
+      $('grid').innerHTML = '';
+      photos.forEach((p, i) => {
+        const c = document.createElement('div');
+        c.className = 'photo-card' + (sel.has(p.id) ? ' selected' : '');
+        c.dataset.i = i;
+        c.tabIndex = isLocked ? -1 : 0;
+        // Hanya render kerangka
+        c.innerHTML = `
+          <div class="photo-card__overlay"></div>
+          <div class="badge-check">✓</div>
+          <div class="badge-name">${esc(p.name)}</div>
+          <button class="zoom-btn" aria-label="Perbesar" tabindex="-1">⤢</button>
+        `;
+        c.onclick = (e) => {
+          if (e.target.closest('.zoom-btn')) openLb(i);
+          else toggle(p.id, c);
+        };
+        c.onkeydown = (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(p.id, c); }
+        };
+        $('grid').append(c);
+      });
+      
+      // Lazy load gambar
+      observer = new IntersectionObserver((entries, obs) => {
+        entries.forEach(ent => {
+          if (ent.isIntersecting) {
+            const card = ent.target;
+            const idx = parseInt(card.dataset.i);
+            const p = photos[idx];
+            if (!card.querySelector('img')) {
+              const img = document.createElement('img');
+              img.src = thumbUrl(p);
+              img.alt = p.name;
+              img.loading = idx < 8 ? 'eager' : 'lazy';
+              img.decoding = idx < 8 ? 'sync' : 'async';
+              card.prepend(img);
+            }
+            obs.unobserve(card);
+          }
+        });
+      }, { rootMargin: '600px' });
+      
+      Array.from($('grid').children).forEach(el => observer.observe(el));
+      checkStatus();
+      updateOpacity();
+    }
+
+    function updateOpacity() {
+       if (!maxSelect) return;
+       const over = sel.size >= maxSelect;
+       Array.from($('grid').children).forEach((c, i) => {
+          const id = photos[i].id;
+          if (over && !sel.has(id)) {
+            c.style.opacity = '0.4';
+            c.style.pointerEvents = 'none';
+          } else {
+            c.style.opacity = '1';
+            c.style.pointerEvents = 'auto';
+          }
+       });
+    }
+
+    function toggle(id, el) {
+      if (isLocked) return;
+      if (!sel.has(id) && maxSelect && sel.size >= maxSelect) {
+         return; // Disabled via pointer-events, just in case
+      }
+      sel.has(id) ? sel.delete(id) : sel.add(id);
+      if (el) el.classList.toggle('selected', sel.has(id));
+      updateOpacity();
+      autoSave();
+      checkStatus();
+      if ($('lb').classList.contains('open')) updateLbBtn();
+    }
+
+    $('allBtn').onclick = () => { if(isLocked) return; photos.forEach(p => sel.add(p.id)); autoSave(); renderSkeleton(); };
+    $('resetBtn').onclick = () => { if(isLocked) return; if(sel.size && confirm('Hapus semua?')) { sel.clear(); autoSave(); renderSkeleton(); } };
+
+    // Lightbox
+    function openLb(i) { cur = i; $('lb').classList.add('open'); showLb(); }
+    function showLb() {
+      const p = photos[cur];
+      $('lbimg').src = fullUrl(p);
+      $('lbname').textContent = p.name;
+      updateLbBtn();
+    }
+    function updateLbBtn() {
+      $('lbselBtn').textContent = sel.has(photos[cur].id) ? 'Batal pilih' : 'Pilih foto ini';
+      $('lbselBtn').disabled = isLocked;
+    }
+    const step = d => { cur = (cur + d + photos.length) % photos.length; showLb(); };
+    $('prevBtn').onclick = () => step(-1);
+    $('nextBtn').onclick = () => step(1);
+    $('closeBtn').onclick = () => $('lb').classList.remove('open');
+    $('lbselBtn').onclick = () => toggle(photos[cur].id, $('grid').children[cur]);
+    
+    document.addEventListener('keydown', e => {
+      if (!$('lb').classList.contains('open')) return;
+      if (e.key === 'ArrowLeft') step(-1);
+      if (e.key === 'ArrowRight') step(1);
+      if (e.key === 'Escape') $('closeBtn').click();
+    });
+
+    let sx = 0;
+    $('lbContent').addEventListener('touchstart', e => sx = e.touches[0].clientX, { passive: true });
+    $('lbContent').addEventListener('touchend', e => {
+      const d = e.changedTouches[0].clientX - sx;
+      if (Math.abs(d) > 50) step(d > 0 ? -1 : 1);
+    });
+
+    // Submit
+    $('sendBtn').onclick = () => {
+      $('dlgCount').textContent = sel.size;
+      $('dlgForm').style.display = 'block';
+      $('dlgSuccess').style.display = 'none';
+      $('dlg').showModal();
+    };
+    $('closeDlgBtn').onclick = () => $('dlg').close();
+    $('confirmSubmitBtn').onclick = async () => {
+      $('confirmSubmitBtn').disabled = true;
+      try {
+        await forceSave(); // Flush pending saves
+        const note = $('note').value;
+        const r = await fetch('/api/selection/submit', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ ids: [...sel], note }) // send latest ids directly to prevent race
+        });
+        if(!r.ok) {
+           const err = await r.json();
+           throw new Error(err.error || 'Gagal submit');
+        }
+        statusData = await r.json();
+        checkStatus();
+        renderSkeleton(); // Re-render to remove opacity locks
+        
+        $('dlgForm').style.display = 'none';
+        $('dlgSuccess').style.display = 'block';
+        
+        if (user.editorWa) {
+          const linkWeb = window.location.origin + '/editor.html?client=' + user.id;
+          const teksWa = `Halo, saya *${user.name}* sudah selesai memilih *${sel.size}* foto.\n\nCatatan tambahan: ${note || '-'}\n\nSilakan cek di sini: ${linkWeb}`;
+          const waUrl = `https://wa.me/${user.editorWa}?text=${encodeURIComponent(teksWa)}`;
+          $('waBtn').href = waUrl;
+          $('waBtn').style.display = 'flex';
+          $('waBtn').style.alignItems = 'center';
+          $('waBtn').style.justifyContent = 'center';
+        }
+      } catch(e) {
+        toast(e.message);
+      } finally {
+        $('confirmSubmitBtn').disabled = false;
+      }
+    };
+
+    init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Login - Pilih Foto</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body style="display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px;">
+  <main style="width: 100%; max-width: 400px;">
+    <div style="background: var(--color-surface); padding: var(--space-5); border-radius: var(--radius-xl); box-shadow: var(--shadow-modal); border: 1px solid var(--color-border);">
+      <h1 class="text-center" style="margin-bottom: var(--space-5);">Masuk</h1>
+      <form id="loginForm">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input type="text" id="username" class="form-control" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" class="form-control" required autocomplete="current-password">
+        </div>
+        <div id="errorMsg" style="color: #D31510; font-size: 14px; margin-bottom: var(--space-4); display: none;"></div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;" id="submitBtn">Masuk</button>
+      </form>
+    </div>
+    
+    <div style="margin-top: var(--space-5); text-align: center; color: var(--color-text-muted);">
+      <p style="margin-bottom: var(--space-2); font-weight: 600;">Akun Percobaan (Prototipe):</p>
+      <div style="display: flex; gap: var(--space-2); justify-content: center; flex-wrap: wrap;">
+        <button class="btn btn-outline" style="height: 32px; font-size: 13px;" onclick="fill('editor', 'editor123')">Editor</button>
+        <button class="btn btn-outline" style="height: 32px; font-size: 13px;" onclick="fill('budi', 'budi123')">Klien Budi</button>
+        <button class="btn btn-outline" style="height: 32px; font-size: 13px;" onclick="fill('ayu', 'ayu123')">Klien Ayu</button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function fill(u, p) {
+      document.getElementById('username').value = u;
+      document.getElementById('password').value = p;
+    }
+    document.getElementById('loginForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const b = document.getElementById('submitBtn');
+      const err = document.getElementById('errorMsg');
+      b.disabled = true; err.style.display = 'none';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login gagal');
+        window.location.href = data.role === 'editor' ? '/editor.html' : '/client.html';
+      } catch (error) {
+        err.textContent = error.message;
+        err.style.display = 'block';
+        b.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>

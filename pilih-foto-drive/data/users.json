@@ -1,0 +1,28 @@
+[
+  {
+    "id": "editor1",
+    "username": "editor",
+    "password": "editor123",
+    "role": "editor",
+    "name": "Studio Editor",
+    "whatsapp": "6287890318741"
+  },
+  {
+    "id": "budi",
+    "username": "budi",
+    "password": "budi123",
+    "role": "client",
+    "name": "Budi & Sari Wedding",
+    "folderId": "1kWFeHliLzO1HYEZ3dh5nFruHxhq7_4Wi",
+    "maxSelect": 20,
+    "resultFolderId": "1kWFeHliLzO1HYEZ3dh5nFruHxhq7_4Wi"
+  },
+  {
+    "id": "ayu",
+    "username": "ayu",
+    "password": "ayu123",
+    "role": "client",
+    "name": "Ayu Graduation",
+    "folderId": ""
+  }
+]

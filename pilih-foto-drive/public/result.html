@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hasil Edit Foto</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    /* Styling khusus result.html */
+    .dl-btn {
+       background: rgba(0,0,0,0.5);
+       color: white;
+       border: 1px solid rgba(255,255,255,0.3);
+       padding: 8px 16px;
+       border-radius: 20px;
+       text-decoration: none;
+       font-weight: 600;
+       display: inline-flex;
+       align-items: center;
+       gap: 6px;
+    }
+    .dl-btn:hover {
+       background: rgba(0,0,0,0.8);
+    }
+    .photo-card { cursor: pointer; }
+    .photo-card:hover { transform: scale(1.02); }
+  </style>
+</head>
+<body>
+  <header class="header-section">
+    <div class="container">
+      <div style="display: flex; flex-direction: column; gap: var(--space-3);">
+        <div>
+          <h1 id="title">Memuat...</h1>
+          <p class="text-muted" style="margin-bottom: 0;">Galeri hasil akhir foto pilihanmu.</p>
+        </div>
+        <div style="display: flex; gap: var(--space-2); flex-wrap: wrap;">
+          <a href="/client.html" class="btn btn-header" style="text-decoration: none;">Kembali</a>
+          <a href="#" id="driveBtn" target="_blank" class="btn" style="background: #4285F4; color: white; border: none; text-decoration: none;">Buka Folder Google Drive</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="errorBox" class="banner" style="display: none; background: #FDE8E8; color: #D31510;"></div>
+    
+    <div class="photo-grid" id="grid"></div>
+  </main>
+
+  <!-- Lightbox -->
+  <div id="lb" class="lightbox" role="dialog" aria-modal="true" aria-label="Pratinjau foto">
+    <div class="lightbox-header">
+      <button class="lightbox-nav" style="position: static; transform: none; background: transparent;" id="closeBtn" aria-label="Tutup">✕</button>
+    </div>
+    <div class="lightbox-content" id="lbContent">
+      <button class="lightbox-nav lightbox-prev" id="prevBtn" aria-label="Foto sebelumnya">‹</button>
+      <img id="lbimg" class="lightbox-img" alt="">
+      <button class="lightbox-nav lightbox-next" id="nextBtn" aria-label="Foto berikutnya">›</button>
+    </div>
+    <div class="lightbox-footer">
+      <span id="lbname" style="font-weight: 600;"></span>
+      <a href="#" id="lbdlBtn" class="dl-btn" target="_blank" rel="noopener noreferrer">📥 Unduh Foto Ini</a>
+    </div>
+  </div>
+
+  <script src="/shared.js"></script>
+  <script>
+    const $ = id => document.getElementById(id);
+    let user = null, photos = [], cur = 0;
+    let observer = null;
+
+    async function init() {
+      try {
+        const uRes = await fetch('/api/me');
+        if (!uRes.ok) throw new Error('Unauthorized');
+        user = await uRes.json();
+        if (user.role !== 'client') return window.location.href = '/editor.html';
+        if (!user.resultFolderId) return window.location.href = '/client.html';
+        
+        $('title').textContent = 'Hasil Edit: ' + user.name;
+        $('driveBtn').href = `https://drive.google.com/drive/folders/${user.resultFolderId}?usp=sharing`;
+        
+        const pRes = await fetch('/api/result-photos');
+        if (!pRes.ok) {
+           const d = await pRes.json();
+           throw new Error(d.error || 'Gagal memuat foto hasil');
+        }
+        const data = await pRes.json();
+        photos = data.files;
+        
+        renderGrid();
+      } catch (err) {
+         if (err.message === 'Unauthorized') return window.location.href = '/login.html';
+         $('errorBox').textContent = 'Error: ' + err.message;
+         $('errorBox').style.display = 'block';
+         $('grid').innerHTML = '';
+      }
+    }
+
+    const thumbUrl = (p) => `/api/thumb/${p.id}?w=400`;
+    const fullUrl = (p) => `/api/thumb/${p.id}?w=1600`;
+    const dlUrl = (p) => `https://drive.google.com/uc?export=download&id=${p.id}`;
+
+    function renderGrid() {
+      $('grid').innerHTML = '';
+      if (!photos.length) {
+         $('grid').innerHTML = '<p class="text-muted" style="grid-column: 1/-1;">Belum ada foto yang diunggah editor.</p>';
+         return;
+      }
+
+      photos.forEach((p, i) => {
+        const c = document.createElement('div');
+        c.className = 'photo-card';
+        c.dataset.i = i;
+        c.tabIndex = 0;
+        c.innerHTML = `
+          <div class="photo-card__overlay" style="opacity: 0;"></div>
+          <div class="badge-name">${esc(p.name)}</div>
+        `;
+        c.onclick = () => openLb(i);
+        c.onkeydown = (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLb(i); }
+        };
+        $('grid').append(c);
+      });
+      
+      observer = new IntersectionObserver((entries, obs) => {
+        entries.forEach(ent => {
+          if (ent.isIntersecting) {
+            const card = ent.target;
+            const idx = parseInt(card.dataset.i);
+            const p = photos[idx];
+            if (!card.querySelector('img')) {
+              const img = document.createElement('img');
+              img.src = thumbUrl(p);
+              img.alt = p.name;
+              img.loading = idx < 8 ? 'eager' : 'lazy';
+              img.decoding = idx < 8 ? 'sync' : 'async';
+              card.prepend(img);
+            }
+            obs.unobserve(card);
+          }
+        });
+      }, { rootMargin: '600px' });
+      
+      Array.from($('grid').children).forEach(el => observer.observe(el));
+    }
+
+    // Lightbox
+    function openLb(i) { cur = i; $('lb').classList.add('open'); showLb(); }
+    function showLb() {
+      const p = photos[cur];
+      $('lbimg').src = fullUrl(p);
+      $('lbname').textContent = p.name;
+      $('lbdlBtn').href = dlUrl(p);
+    }
+    
+    const step = d => { cur = (cur + d + photos.length) % photos.length; showLb(); };
+    $('prevBtn').onclick = () => step(-1);
+    $('nextBtn').onclick = () => step(1);
+    $('closeBtn').onclick = () => $('lb').classList.remove('open');
+    
+    document.addEventListener('keydown', e => {
+      if (!$('lb').classList.contains('open')) return;
+      if (e.key === 'ArrowLeft') step(-1);
+      if (e.key === 'ArrowRight') step(1);
+      if (e.key === 'Escape') $('closeBtn').click();
+    });
+
+    let sx = 0;
+    $('lbContent').addEventListener('touchstart', e => sx = e.touches[0].clientX, { passive: true });
+    $('lbContent').addEventListener('touchend', e => {
+      const d = e.changedTouches[0].clientX - sx;
+      if (Math.abs(d) > 50) step(d > 0 ? -1 : 1);
+    });
+
+    init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dashboard Editor - Pilih Foto</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    /* Two-panel layout for detail */
+    body.view-mode #listPanel { display: none; }
+    body.view-mode #detailPanel { display: block; }
+    #detailPanel { display: none; }
+    
+    @media (min-width: 1024px) {
+      body.view-mode #listPanel { display: block; width: 350px; flex-shrink: 0; border-right: 1px solid var(--color-border); padding-right: var(--space-4); }
+      body.view-mode #main { display: flex; gap: var(--space-4); align-items: flex-start; }
+      body.view-mode #detailPanel { flex: 1; min-width: 0; }
+      .back-btn { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header-section">
+    <div class="container">
+      <div style="display: flex; flex-direction: column; gap: var(--space-3);">
+        <div>
+          <h1>Dashboard Editor</h1>
+          <p class="text-muted" style="margin: 0;">Pantau dan kelola pilihan foto dari klien.</p>
+        </div>
+        <div style="display: flex; gap: var(--space-2); flex-wrap: wrap;">
+          <button class="btn" style="background: #25D366; color: white; border: none;" onclick="openSettings()">💬 Pengaturan WA</button>
+          <button class="btn btn-header" onclick="logout()">Keluar</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container" id="main">
+    <div id="listPanel">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4); flex-wrap: wrap; gap: var(--space-3);">
+        <h2 style="margin: 0;">Daftar Klien</h2>
+        <div style="display: flex; gap: var(--space-2);">
+          <button class="btn btn-primary" style="height: 36px; font-size: 14px;" onclick="openManageDialog()">+ Klien Baru</button>
+          <button class="btn btn-outline" style="height: 36px; font-size: 14px;" onclick="loadClients()">↻ Refresh</button>
+        </div>
+      </div>
+      <div id="clientsList">Memuat...</div>
+    </div>
+
+    <div id="detailPanel">
+      <div style="display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-4);">
+        <button class="btn btn-outline back-btn" style="height: 36px; font-size: 14px; padding: 0 12px;" onclick="closeDetail()">← Kembali</button>
+        <h2 id="detailTitle" style="margin: 0;">Detail Klien</h2>
+        <span id="detailBadge"></span>
+      </div>
+      <div id="detailContent"></div>
+    </div>
+  </main>
+
+  <!-- Dialog Atur Klien -->
+  <dialog id="manageDlg">
+    <h2 id="manageTitle">Atur Klien</h2>
+    <form id="manageForm">
+      <input type="hidden" id="mId">
+      <div class="form-group">
+        <label>ID Klien (Username)</label>
+        <input type="text" id="mUsername" class="form-control" required placeholder="mis. andi_wedding">
+        <small class="text-muted">Hanya bisa diisi saat membuat baru</small>
+      </div>
+      <div class="form-group">
+        <label>Nama Tampilan</label>
+        <input type="text" id="mName" class="form-control" required placeholder="mis. Andi & Siska Wedding">
+      </div>
+      <div class="form-group" id="mPasswordGroup">
+        <label>Password (Opsional)</label>
+        <input type="text" id="mPassword" class="form-control" placeholder="Kosongkan jika tidak ingin mengubah">
+      </div>
+      <div class="form-group">
+        <label>Link Folder Google Drive (Mentah)</label>
+        <input type="text" id="mLink" class="form-control" placeholder="Paste link folder mentah...">
+        <div style="margin-top: 8px; font-size: 14px;" id="mLinkResult"></div>
+      </div>
+      <div class="form-group">
+        <label>Link Folder Hasil Edit (Opsional)</label>
+        <input type="text" id="mResultLink" class="form-control" placeholder="Paste link folder hasil akhir...">
+        <div style="margin-top: 8px; font-size: 14px;" id="mResultLinkResult"></div>
+      </div>
+      <div class="form-group">
+        <label>Batas Pilihan Foto</label>
+        <input type="number" id="mLimit" class="form-control" min="0" placeholder="0 = tanpa batas">
+      </div>
+      <div style="display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-5);">
+        <button type="button" class="btn btn-outline" style="color: #D31510; border-color: #D31510; margin-right: auto; display: none;" id="mDeleteBtn" onclick="deleteClient()">Hapus Klien</button>
+        <button type="button" class="btn btn-outline" onclick="$('manageDlg').close()">Batal</button>
+        <button type="submit" class="btn btn-primary" id="mSubmit">Simpan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Dialog Pengaturan WA Editor -->
+  <dialog id="settingsDlg">
+    <h2>Pengaturan WhatsApp</h2>
+    <form id="settingsForm">
+      <div class="form-group">
+        <label>Nomor WA Editor</label>
+        <input type="text" id="sWa" class="form-control" placeholder="mis. 6281234567890">
+        <small class="text-muted">Awali dengan kode negara tanpa + atau 0. Kosongkan untuk menonaktifkan tombol WA di klien.</small>
+      </div>
+      <div style="display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-4);">
+        <button type="button" class="btn btn-outline" onclick="$('settingsDlg').close()">Batal</button>
+        <button type="submit" class="btn btn-primary" id="sSubmit">Simpan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Lightbox Editor -->
+  <div id="lb" class="lightbox" role="dialog" aria-modal="true">
+    <div class="lightbox-header">
+      <button class="lightbox-nav" style="position: static; transform: none; background: transparent;" onclick="$('lb').classList.remove('open')">✕</button>
+    </div>
+    <div class="lightbox-content" id="lbContent">
+      <button class="lightbox-nav lightbox-prev" id="prevBtn">‹</button>
+      <img id="lbimg" class="lightbox-img" alt="">
+      <button class="lightbox-nav lightbox-next" id="nextBtn">›</button>
+    </div>
+    <div class="lightbox-footer">
+      <span id="lbname" style="font-weight: 600;"></span>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/shared.js"></script>
+  <script>
+    const $ = id => document.getElementById(id);
+    let clients = [], currentPhotos = [], currentCur = 0;
+    let editorData = null;
+
+    async function init() {
+      const r = await fetch('/api/me');
+      if (!r.ok) return window.location.href = '/login.html';
+      const u = await r.json();
+      if (u.role !== 'editor') return window.location.href = '/client.html';
+      editorData = u;
+      
+      await loadClients();
+      
+      // Auto-open client if url has ?client=id
+      const urlParams = new URLSearchParams(window.location.search);
+      const initialClient = urlParams.get('client');
+      if (initialClient && clients.find(c => c.id === initialClient)) {
+        viewClient(initialClient);
+      }
+      
+      setInterval(loadClients, 15000);
+    }
+
+    async function logout() {
+      await fetch('/api/logout', { method: 'POST' });
+      window.location.href = '/login.html';
+    }
+
+    function openSettings() {
+       $('sWa').value = editorData.whatsapp || '';
+       $('settingsDlg').showModal();
+    }
+
+    $('settingsForm').onsubmit = async (e) => {
+       e.preventDefault();
+       $('sSubmit').disabled = true;
+       try {
+         const wa = $('sWa').value.replace(/[^0-9]/g, '');
+         const r = await fetch('/api/editor/settings', {
+            method: 'PATCH', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ whatsapp: wa })
+         });
+         if (!r.ok) throw new Error((await r.json()).error);
+         editorData.whatsapp = wa;
+         toast('Pengaturan WA disimpan');
+         $('settingsDlg').close();
+       } catch (err) {
+         toast(err.message);
+       } finally {
+         $('sSubmit').disabled = false;
+       }
+    };
+
+    async function loadClients() {
+      try {
+        const r = await fetch('/api/editor/clients');
+        if (!r.ok) throw new Error('Gagal memuat');
+        clients = await r.json();
+        renderClients();
+      } catch (e) {
+        $('clientsList').textContent = e.message;
+      }
+    }
+
+    function renderClients() {
+      const list = $('clientsList');
+      if (!clients.length) return list.innerHTML = '<p class="text-muted">Belum ada data klien.</p>';
+      
+      list.innerHTML = '';
+      clients.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'client-card';
+        
+        let statusBadge = '';
+        if (c.status === 'submitted') statusBadge = '<span class="badge-status status-submitted">Terkirim 🔒</span>';
+        else if (c.status === 'draft') statusBadge = '<span class="badge-status status-draft">Draft</span>';
+        else if (c.status === 'reopened') statusBadge = '<span class="badge-status status-reopened">Dibuka Kembali</span>';
+        else statusBadge = '<span class="badge-status" style="background:var(--color-bg-subtle); border: 1px solid var(--color-border);">Belum Mulai</span>';
+
+        let dateStr = '-';
+        if (c.updatedAt) dateStr = new Date(c.updatedAt).toLocaleString('id-ID');
+        const limitStr = c.maxSelect ? ` / ${c.maxSelect}` : '';
+
+        card.innerHTML = `
+          <div class="client-card-header">
+            <h3 class="client-card-title">${esc(c.name)} ${c.resultFolderId ? '✅' : ''}</h3>
+            ${statusBadge}
+          </div>
+          <div class="text-muted" style="font-size: 14px; display: grid; gap: 4px;">
+            <span>Terpilih: <strong>${c.selectedCount}${limitStr}</strong> foto</span>
+            <span>Update: ${dateStr}</span>
+          </div>
+          <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2); flex-wrap: wrap;">
+            <button class="btn btn-primary" onclick="viewClient('${c.id}')" ${c.selectedCount === 0 ? 'disabled' : ''}>Lihat Pilihan</button>
+            <button class="btn btn-outline" onclick="openManageDialog('${c.id}')">Atur</button>
+            ${c.status === 'submitted' ? `<button class="btn btn-outline" onclick="reopen('${c.id}')">Buka Kunci</button>` : ''}
+          </div>
+        `;
+        list.appendChild(card);
+      });
+    }
+
+    // --- Manage Client (Paste Link) ---
+    let validatedFolderId = null;
+    let validatedResultFolderId = null;
+
+    function openManageDialog(id) {
+      validatedFolderId = null;
+      validatedResultFolderId = null;
+      $('mLinkResult').innerHTML = '';
+      $('mLink').value = '';
+      $('mResultLinkResult').innerHTML = '';
+      $('mResultLink').value = '';
+      
+      if (id) {
+         const c = clients.find(x => x.id === id);
+         $('manageTitle').textContent = 'Atur Klien: ' + c.name;
+         $('mId').value = c.id;
+         $('mUsername').value = c.id;
+         $('mUsername').disabled = true;
+         $('mName').value = c.name;
+         $('mLimit').value = c.maxSelect || 0;
+         $('mPasswordGroup').style.display = 'block';
+         $('mPassword').value = '';
+         $('mDeleteBtn').style.display = 'block';
+         
+         if (c.folderId) {
+            validatedFolderId = c.folderId;
+            $('mLink').value = `https://drive.google.com/drive/folders/${c.folderId}`;
+            $('mLinkResult').innerHTML = `✅ Terhubung dengan Folder ID: <strong>${c.folderId}</strong>`;
+         }
+         if (c.resultFolderId) {
+            validatedResultFolderId = c.resultFolderId;
+            $('mResultLink').value = `https://drive.google.com/drive/folders/${c.resultFolderId}`;
+            $('mResultLinkResult').innerHTML = `✅ Terhubung dengan Folder ID: <strong>${c.resultFolderId}</strong>`;
+         }
+      } else {
+         $('manageTitle').textContent = 'Buat Klien Baru';
+         $('mId').value = '';
+         $('mUsername').value = '';
+         $('mUsername').disabled = false;
+         $('mName').value = '';
+         $('mLimit').value = 0;
+         $('mPasswordGroup').style.display = 'block';
+         $('mPassword').value = 'password123';
+         $('mDeleteBtn').style.display = 'none';
+      }
+      $('manageDlg').showModal();
+    }
+
+    async function deleteClient() {
+      const id = $('mId').value;
+      if (!id) return;
+      const c = clients.find(x => x.id === id);
+      if(!confirm(`Yakin ingin menghapus klien ${c.name}? Semua data pilihannya akan ikut terhapus.`)) return;
+      
+      try {
+        const r = await fetch(`/api/editor/clients/${id}`, { method: 'DELETE' });
+        if(!r.ok) throw new Error((await r.json()).error);
+        toast('Klien berhasil dihapus');
+        $('manageDlg').close();
+        loadClients();
+        if ($('detailTitle').textContent === c.name) closeDetail();
+      } catch (err) {
+        toast('Gagal: ' + err.message);
+      }
+    }
+
+    async function checkDriveLink(val, outEl, successLabel, onValid) {
+       const ext = extractFolderId(val);
+       if (!ext) {
+          outEl.innerHTML = '<span style="color:#D31510">❌ Link/ID tidak valid</span>';
+          onValid(null);
+          return;
+       }
+       outEl.innerHTML = '⏳ Mengecek folder...';
+       
+       try {
+          const r = await fetch('/api/editor/drive/resolve', {
+             method: 'POST', headers: {'Content-Type':'application/json'},
+             body: JSON.stringify({ input: ext })
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error);
+          outEl.innerHTML = `✅ <strong>${esc(d.name)}</strong> — ${d.photoCount} foto`;
+          onValid(d.folderId);
+       } catch (err) {
+          outEl.innerHTML = `<span style="color:#D31510">❌ Error: ${esc(err.message)}</span>`;
+          onValid(null);
+       }
+    }
+
+    $('mLink').addEventListener('input', e => {
+      checkDriveLink(e.target.value, $('mLinkResult'), 'Folder Mentah', (id) => validatedFolderId = id);
+    });
+    $('mResultLink').addEventListener('input', e => {
+      checkDriveLink(e.target.value, $('mResultLinkResult'), 'Folder Hasil', (id) => validatedResultFolderId = id);
+    });
+
+    $('manageForm').onsubmit = async (e) => {
+      e.preventDefault();
+      $('mSubmit').disabled = true;
+      try {
+        const id = $('mId').value;
+        const body = {
+           id: $('mUsername').value,
+           name: $('mName').value,
+           maxSelect: parseInt($('mLimit').value) || 0,
+           password: $('mPassword').value || undefined
+        };
+        if (validatedFolderId) body.folderId = validatedFolderId;
+        if (validatedResultFolderId !== null) body.resultFolderId = validatedResultFolderId;
+
+        if (id) { // Edit
+           const c = clients.find(x => x.id === id);
+           if (body.folderId && body.folderId !== c.folderId && c.selectedCount > 0) {
+              if(!confirm('Folder mentah diubah! Pilihan klien yang sudah ada akan di-reset. Lanjutkan?')) return;
+           }
+           const r = await fetch(`/api/editor/clients/${id}`, { method: 'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+           if(!r.ok) throw new Error((await r.json()).error);
+           toast('Berhasil disimpan');
+        } else { // New
+           body.username = body.id;
+           const r = await fetch(`/api/editor/clients`, { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+           if(!r.ok) throw new Error((await r.json()).error);
+           toast('Klien dibuat');
+        }
+        $('manageDlg').close();
+        loadClients();
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        $('mSubmit').disabled = false;
+      }
+    };
+
+    async function reopen(clientId) {
+      if(!confirm('Buka kembali akses untuk klien ini?')) return;
+      try {
+        const r = await fetch(`/api/editor/clients/${clientId}/reopen`, { method: 'POST' });
+        if(!r.ok) throw new Error((await r.json()).error);
+        toast('Akses dibuka kembali');
+        loadClients();
+      } catch (e) { toast('Gagal: ' + e.message); }
+    }
+
+    // --- Detail View ---
+    const thumbUrl = (p) => `/api/thumb/${p.id}?w=400`;
+    const fullUrl = (p) => `/api/thumb/${p.id}?w=1600`;
+
+    function closeDetail() { document.body.classList.remove('view-mode'); }
+
+    async function viewClient(clientId) {
+      document.body.classList.add('view-mode');
+      $('detailContent').innerHTML = '<p>Memuat...</p>';
+      
+      const c = clients.find(x => x.id === clientId);
+      $('detailTitle').textContent = c ? c.name : clientId;
+
+      try {
+        const r = await fetch(`/api/editor/clients/${clientId}`);
+        if (!r.ok) throw new Error('Gagal mengambil data detail');
+        const data = await r.json();
+        
+        currentPhotos = data.photos;
+        
+        let noteHtml = data.note ? `<div class="banner">📝 <strong>Catatan Klien:</strong>&nbsp; ${esc(data.note)}</div>` : '';
+        
+        let gridHtml = '<div class="photo-grid" style="margin-top: 16px;">';
+        data.photos.forEach((p, i) => {
+           gridHtml += `
+             <div class="photo-card" onclick="openLb(${i})">
+               <img src="${thumbUrl(p)}" loading="lazy" style="border-radius: 16px;">
+               <div class="badge-name" style="opacity: 1; bottom: 8px;">${esc(p.name)}</div>
+             </div>
+           `;
+        });
+        gridHtml += '</div>';
+
+        // CSV data generator
+        let csv = 'nama_file,id\n' + data.photos.map(p => `"${p.name}","${p.id}"`).join('\n');
+        const csvBlob = new Blob([csv], { type: 'text/csv' });
+        const csvUrl = URL.createObjectURL(csvBlob);
+
+        $('detailContent').innerHTML = `
+          ${noteHtml}
+          <div style="display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;">
+            <a href="${csvUrl}" download="pilihan_${clientId}.csv" class="btn btn-outline" style="height: 32px; font-size: 13px;">📥 Unduh CSV</a>
+            <button class="btn btn-outline" style="height: 32px; font-size: 13px;" onclick="navigator.clipboard.writeText('${csv.replace(/\n/g, '\\n')}'); toast('Disalin')">📋 Salin Teks</button>
+          </div>
+          ${gridHtml}
+        `;
+      } catch (e) {
+        $('detailContent').innerHTML = `<span style="color:red">Error: ${e.message}</span>`;
+      }
+    }
+
+    function openLb(i) { currentCur = i; $('lb').classList.add('open'); showLb(); }
+    function showLb() {
+      const p = currentPhotos[currentCur];
+      $('lbimg').src = fullUrl(p);
+      $('lbname').textContent = p.name;
+    }
+    const stepLb = d => { currentCur = (currentCur + d + currentPhotos.length) % currentPhotos.length; showLb(); };
+    $('prevBtn').onclick = () => stepLb(-1);
+    $('nextBtn').onclick = () => stepLb(1);
+    
+    document.addEventListener('keydown', e => {
+      if (!$('lb').classList.contains('open')) return;
+      if (e.key === 'ArrowLeft') stepLb(-1);
+      if (e.key === 'ArrowRight') stepLb(1);
+      if (e.key === 'Escape') $('lb').classList.remove('open');
+    });
+
+    init();
+  </script>
+</body>
+</html>
