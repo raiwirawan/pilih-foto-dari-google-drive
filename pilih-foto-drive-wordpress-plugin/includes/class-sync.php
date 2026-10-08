@@ -46,13 +46,25 @@ class Sync {
                 $seen_drive_ids[] = $drive_id;
                 $version = $file['md5Checksum'] ?? $file['modifiedTime'] ?? 'v1';
 
+                $width = isset($file['imageMediaMetadata']['width']) ? intval($file['imageMediaMetadata']['width']) : null;
+                $height = isset($file['imageMediaMetadata']['height']) ? intval($file['imageMediaMetadata']['height']) : null;
+                $thumbnail_link = $file['thumbnailLink'] ?? null;
+
                 if ( isset( $existing_map[ $drive_id ] ) ) {
                     // Update if needed
                     $p = $existing_map[ $drive_id ];
-                    if ( $p['drive_version'] !== $version || $p['position'] != $position || $p['name'] !== $file['name'] ) {
+                    if ( $p['drive_version'] !== $version || $p['position'] != $position || $p['name'] !== $file['name'] || $p['thumbnail_link'] !== $thumbnail_link ) {
                         $wpdb->update(
                             "{$wpdb->prefix}pf_photos",
-                            [ 'name' => $file['name'], 'drive_version' => $version, 'position' => $position, 'synced_at' => current_time('mysql') ],
+                            [ 
+                                'name' => $file['name'], 
+                                'drive_version' => $version, 
+                                'position' => $position, 
+                                'synced_at' => current_time('mysql'),
+                                'thumbnail_link' => $thumbnail_link,
+                                'width' => $width,
+                                'height' => $height
+                            ],
                             [ 'id' => $p['id'] ]
                         );
                     }
@@ -68,7 +80,10 @@ class Sync {
                             'mime' => $file['mimeType'],
                             'drive_version' => $version,
                             'position' => $position,
-                            'synced_at' => current_time('mysql')
+                            'synced_at' => current_time('mysql'),
+                            'thumbnail_link' => $thumbnail_link,
+                            'width' => $width,
+                            'height' => $height
                         ]
                     );
                 }

@@ -3,13 +3,13 @@ namespace PilihFoto;
 
 class Rest_Client {
     public static function register_routes() {
-        register_rest_route( 'pilihfoto/v1', '/client/galleries', array(
+        register_rest_route( 'studio/v1', '/client/galleries', array(
             'methods' => 'GET',
             'callback' => array( __CLASS__, 'get_galleries' ),
             'permission_callback' => array( __CLASS__, 'check_client_permission' ),
         ) );
 
-        register_rest_route( 'pilihfoto/v1', '/client/galleries/(?P<id>\d+)', array(
+        register_rest_route( 'studio/v1', '/client/galleries/(?P<id>\d+)', array(
             'methods' => 'GET',
             'callback' => array( __CLASS__, 'get_gallery_details' ),
             'permission_callback' => array( __CLASS__, 'check_gallery_permission' ),
@@ -20,7 +20,7 @@ class Rest_Client {
             ),
         ) );
 
-        register_rest_route( 'pilihfoto/v1', '/client/galleries/(?P<id>\d+)/selection', array(
+        register_rest_route( 'studio/v1', '/client/galleries/(?P<id>\d+)/selection', array(
             'methods' => 'PATCH',
             'callback' => array( __CLASS__, 'update_selection' ),
             'permission_callback' => array( __CLASS__, 'check_gallery_permission' ),
@@ -31,7 +31,7 @@ class Rest_Client {
             ),
         ) );
 
-        register_rest_route( 'pilihfoto/v1', '/client/galleries/(?P<id>\d+)/submit', array(
+        register_rest_route( 'studio/v1', '/client/galleries/(?P<id>\d+)/submit', array(
             'methods' => 'POST',
             'callback' => array( __CLASS__, 'submit_selection' ),
             'permission_callback' => array( __CLASS__, 'check_gallery_permission' ),
@@ -43,16 +43,19 @@ class Rest_Client {
     }
 
     public static function check_client_permission() {
-        return current_user_can( 'pf_view_own_gallery' ) || current_user_can( 'pf_manage_galleries' );
+        $account = Auth::check();
+        return $account && ($account->role === 'client' || $account->role === 'editor');
     }
 
     public static function check_gallery_permission( $request ) {
-        if ( ! self::check_client_permission() ) return false;
+        $account = Auth::check();
+        if ( ! $account ) return false;
+        if ( $account->role === 'editor' ) return true;
         
         $gallery = DB::get_gallery( $request['id'] );
         if ( ! $gallery ) return false;
 
-        if ( ! current_user_can( 'pf_manage_galleries' ) && get_current_user_id() != $gallery->client_user_id ) {
+        if ( $account->id != $gallery->client_user_id ) {
             return false;
         }
 
@@ -60,8 +63,8 @@ class Rest_Client {
     }
 
     public static function get_galleries( $request ) {
-        $user_id = get_current_user_id();
-        $galleries = DB::get_galleries_by_client( $user_id );
+        $account = Auth::check();
+        $galleries = DB::get_galleries_by_client( $account->id );
         return rest_ensure_response( $galleries );
     }
 
@@ -72,6 +75,16 @@ class Rest_Client {
         $photos = DB::get_photos( $id, 'source' );
         $results = DB::get_photos( $id, 'result' );
         $selections = DB::get_selections( $id );
+
+        // Bersihkan data sesuai security requirement
+        foreach($photos as &$p) {
+            unset($p->drive_file_id);
+        }
+        foreach($results as &$r) {
+            unset($r->drive_file_id);
+        }
+        unset($gallery->source_folder_id);
+        unset($gallery->result_folder_id);
 
         return rest_ensure_response( array(
             'gallery' => $gallery,
