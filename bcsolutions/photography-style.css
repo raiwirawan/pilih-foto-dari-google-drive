@@ -1,0 +1,262 @@
+/* =====================================================================
+   BC PHOTOGRAPHY — style landing page (bcsolutions.id/photography-bali)
+   Dipisah dari photography-bali.html — isi identik dengan versi inline.
+   ===================================================================== */
+:root {
+  --bg: #0a0a0a; /* Hitam pekat */
+  --fg: #F1EFE9; /* Teks putih tulang */
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scrollbar-width: thin; }
+body.bcs-photography-page {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+  overflow-x: hidden;
+}
+
+/* ---------- ANIMATED GRADIENT BLOBS ---------- */
+.blob {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(140px);
+  z-index: -2;
+  pointer-events: none;
+  opacity: 0.65;
+  will-change: transform;
+}
+#blob1 {
+  width: 60vw; height: 60vh;
+  background: #8A151B; /* Merah gelap estetik */
+  top: -10%; left: -10%;
+  animation: float1 12s infinite alternate ease-in-out;
+}
+#blob2 {
+  width: 50vw; height: 50vh;
+  background: #E53935; /* Merah sedikit lebih terang */
+  bottom: -10%; right: -10%;
+  animation: float2 16s infinite alternate-reverse ease-in-out;
+}
+@keyframes float1 {
+  0% { transform: translate(0, 0) scale(1); }
+  100% { transform: translate(40vw, 40vh) scale(1.3); }
+}
+@keyframes float2 {
+  0% { transform: translate(0, 0) scale(1); }
+  100% { transform: translate(-40vw, -40vh) scale(1.4); }
+}
+
+a { color: inherit; text-decoration: none; }
+img { display: block; }
+
+/* ---------- tulisan raksasa terkunci di tengah layar ---------- */
+#wordmark {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1;                        /* agar foto (z=2) bisa lewat di atas teks */
+  font-family: "Anton", Impact, "Arial Narrow", sans-serif;
+  font-weight: 400;
+  font-size: clamp(40px, 8.4vw, 150px);
+  letter-spacing: .01em;
+  white-space: nowrap;
+  color: var(--fg);
+  user-select: none;
+  pointer-events: none;
+  opacity: 0;                        /* Awalnya sembunyi */
+  transition: opacity 0.8s ease, color 1s ease;
+}
+body.bcs-photography-page.finished #wordmark {
+  opacity: 1;                        /* Muncul di tengah setelah foto menyebar */
+}
+
+/* ---------- dunia kolase (fixed + digeser transform utk smooth scroll) ---------- */
+#world {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 2;
+  will-change: transform;
+}
+#spacer { position: relative; z-index: -1; }
+
+.ph {
+  position: absolute; cursor: pointer; overflow: hidden;
+  /* Awal: offset ke tengah + sedikit rotasi untuk efek tumpukan */
+  transform: translate(var(--tx, 0px), var(--ty, 0px)) scale(0.85) rotate(var(--rot, 0deg));
+  opacity: 0;
+  transition: opacity 0.25s ease-out; /* Transisi cepat saat menumpuk */
+}
+body.bcs-photography-page.loaded .ph {
+  /* Saat menyebar: kembali ke posisi asli, rotasi hilang, opacity 100% */
+  transform: translate(0, 0) scale(1) rotate(0deg);
+  opacity: 1;
+  transition: transform 1.1s cubic-bezier(.77,0,.175,1),
+              opacity 0.8s ease;
+}
+body.bcs-photography-page.no-anim .ph {
+  transition: none !important;
+}
+.ph img { width: 100%; height: 100%; object-fit: cover; transition: opacity .3s; }
+.ph:hover img { opacity: .92; }
+
+/* ---------- tombol + (menu) ---------- */
+#plus {
+  position: fixed;
+  top: 26px; left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  width: 42px; height: 42px;
+  background: none; border: none; cursor: pointer;
+  color: var(--fg);
+  transition: color 1s ease;
+}
+#plus svg { width: 100%; height: 100%; transition: transform .35s ease; }
+#plus.open svg { transform: rotate(45deg); }
+
+/* ---------- overlay menu ---------- */
+#menu {
+  position: fixed; inset: 0; z-index: 90;
+  background-color: var(--bg);
+  color: var(--fg);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: background-color 1s ease, color 1s ease;
+}
+#menu.open { display: flex; }
+#menu a {
+  font-family: "Anton", Impact, sans-serif;
+  font-size: clamp(30px, 5.4vw, 64px);
+  text-transform: uppercase;
+  transition: opacity .25s, color 1s ease;
+  color: var(--fg);
+  text-decoration: none;
+}
+#menu a:hover { opacity: .45; }
+#menu .sub { font-size: 13px; opacity: 0.6; margin-top: 26px; letter-spacing: .08em; }
+
+/* ---------- MODE FOKUS ---------- */
+#focus {
+  position: fixed; inset: 0; z-index: 80;
+  background-color: var(--bg);
+  display: none;
+  overscroll-behavior: contain;
+  transition: background-color 1s ease;
+}
+#focus.open { display: block; }
+
+#rail {
+  position: absolute; top: 0; bottom: 70px; left: 20px;
+  width: 230px;
+  z-index: 5;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 24px 0 24px 16px;
+  scrollbar-width: none;
+}
+#rail::-webkit-scrollbar { display: none; }
+#rail .thumb {
+  width: 84px; margin-bottom: 18px; cursor: pointer;
+  opacity: .5;
+  transition: opacity .3s, transform .3s cubic-bezier(.16,1,.3,1);
+  transform: translateX(0);
+}
+#rail .thumb:hover { opacity: .8; }
+#rail .thumb.active {
+  opacity: 1;
+  transform: translateX(80px);
+}
+#rail .thumb.adj1 {
+  transform: translateX(30px);
+}
+#rail .thumb img { width: 100%; height: auto; }
+
+#stage {
+  position: absolute; inset: 0 0 70px 0;
+  display: flex; align-items: center; justify-content: center;
+}
+#stage img {
+  position: absolute;
+  max-width: 66vw;
+  max-height: 82%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity .45s ease;
+}
+#stage img.show { opacity: 1; }
+
+#back {
+  position: absolute; bottom: 16px; left: 50%;
+  transform: translateX(-50%);
+  font-family: "Anton", Impact, sans-serif;
+  font-size: 28px; letter-spacing: .04em;
+  background: none; border: none; cursor: pointer; color: var(--fg);
+  z-index: 5;
+  transition: color 1s ease;
+}
+#back:hover { opacity: .5; }
+
+/* caption vertikal di sisi kanan foto (seperti referensi) — hanya mobile */
+#caption {
+  display: none;
+  position: absolute;
+  right: 10px; top: 50%;
+  transform: translateY(-50%);
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--fg);
+  opacity: .85;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  clip: rect(0 0 0 0); overflow: hidden; white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+  /* MODE FOKUS mobile (seperti referensi):
+     BACK di ATAS (di bawah tombol +), foto di tengah, rel thumbnail jadi
+     STRIP HORIZONTAL di bawah — thumbnail aktif TERANGKAT ke atas. */
+  #back { bottom: auto; top: 74px; font-size: 22px; }
+  #rail {
+    top: auto; left: 0; right: 0; bottom: 0;
+    width: auto; height: 150px;
+    padding: 0 16px 14px;
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    overflow-x: auto; overflow-y: hidden;
+  }
+  #rail .thumb { width: 56px; flex: none; margin-bottom: 0; }
+  #rail .thumb.active { transform: translateY(-30px); }
+  #rail .thumb.adj1 { transform: translateY(-13px); }
+  #stage { inset: 116px 0 160px 0; }
+  #stage img { max-width: calc(100vw - 70px); max-height: 100%; }
+  #caption { display: block; }
+  #menu .sub {width: 300px; text-align: center;}
+
+  /* Blob di layar kecil: blur 140px membanjiri seluruh viewport dengan
+     merah — kecilkan, redupkan, dan kurangi blur supaya latar tetap
+     dominan hitam seperti di desktop. */
+  .blob { filter: blur(70px); opacity: 0.35; }
+  #blob1 { width: 90vw; height: 40vh; }
+  #blob2 { width: 80vw; height: 35vh; }
+  @keyframes float1 {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(30vw, 30vh) scale(1.15); }
+  }
+  @keyframes float2 {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-30vw, -30vh) scale(1.2); }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ph { transition: none !important; }
+  #blur-overlay { transition: none !important; }
+  #wordmark { transition: none !important; }
+}
