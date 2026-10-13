@@ -63,11 +63,13 @@
 .st-photo-card {
   position: relative; border-radius: var(--st-radius-lg); overflow: hidden;
   background: var(--st-bg-subtle); aspect-ratio: 1/1; cursor: pointer; user-select: none;
-  border: 2px solid transparent; transition: all var(--st-dur-fast);
+  border: 2px solid transparent; transition: border-color var(--st-dur-fast), opacity var(--st-dur-fast);
+  content-visibility: auto; contain-intrinsic-size: 220px;
 }
-.st-photo-card img { width: 100%; height: 100%; object-fit: cover; transition: transform var(--st-dur-slow); }
+.st-photo-card img { width: 100%; height: 100%; object-fit: cover; transition: transform var(--st-dur-slow); display: block; }
 .st-photo-card:hover img { transform: scale(1.04); }
 .st-photo-card.st-selected { border-color: var(--st-accent-blue); }
+.st-limit-reached .st-photo-card:not(.st-selected) { opacity: 0.45; }
 
 .st-photo-card__overlay { position: absolute; inset: 0; background: var(--st-overlay-gradient); opacity: 0; pointer-events: none; transition: opacity var(--st-dur-base); }
 .st-photo-card:hover .st-photo-card__overlay { opacity: 1; }
@@ -77,15 +79,16 @@
   position: absolute; top: var(--st-space-2); left: var(--st-space-2);
   background: var(--st-accent-blue); color: #fff; border-radius: var(--st-radius-pill);
   width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
-  font-size: 14px; opacity: 0; transform: scale(0.8); transition: all var(--st-dur-fast);
+  font-size: 14px; opacity: 0; transform: scale(0.8); transition: all var(--st-dur-fast); pointer-events: none;
 }
 .st-photo-card.st-selected .st-badge-check { opacity: 1; transform: scale(1); }
 
 .st-badge-name {
   position: absolute; bottom: var(--st-space-2); left: var(--st-space-2); right: 38px;
   color: #fff; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  opacity: 0; transition: opacity var(--st-dur-base); z-index: 2;
+  opacity: 0; transition: opacity var(--st-dur-base); z-index: 2; pointer-events: none;
 }
+.st-badge-name--missing { color: #fbbf24; font-style: italic; }
 .st-photo-card:hover .st-badge-name, .st-photo-card.st-selected .st-badge-name { opacity: 1; }
 @media(hover:none){ .st-badge-name { opacity: 1; } }
 
@@ -128,11 +131,31 @@
   background: var(--st-bg); color: var(--st-text); font-family: var(--st-font-sans); font-size: 15px; resize: vertical;
 }
 
-.st-photo-card.st-img-error::before {
-  content: "Gagal memuat pratinjau";
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  padding: 12px; text-align: center; font-size: 12px; color: var(--st-text-muted);
+.st-img-retry-wrap {
+  position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 12px; text-align: center; font-size: 12px; color: var(--st-text-muted); background: var(--st-bg-subtle); z-index: 2;
 }
+.st-photo-card.st-img-error .st-img-retry-wrap { display: flex; }
+.st-photo-card.st-img-error img { opacity: 0; }
+.st-retry-img-btn {
+  padding: 4px 10px; font-size: 12px; font-weight: 600; border-radius: var(--st-radius-pill);
+  border: 1px solid var(--st-border); background: var(--st-surface); color: var(--st-text); cursor: pointer;
+}
+.st-retry-img-btn:hover { border-color: var(--st-text); }
+
+.st-shell-loading { padding: 50px; text-align: center; color: var(--st-text-muted); }
+.st-shell-noscript { padding: 50px; text-align: center; color: #ff4d4f; }
+.st-admin-warning {
+  background: #b30000; color: #ffffff; padding: 12px 16px; text-align: center;
+  font-family: var(--st-font-sans, sans-serif); font-weight: 600;
+}
+
+.st-save-status {
+  font-size: 12px; font-weight: 600; color: var(--st-text-muted); margin-top: 2px; min-height: 16px;
+}
+.st-save-status.st-saving { color: #fbbf24; }
+.st-save-status.st-saved { color: #4ade80; }
+.st-save-status.st-save-err { color: #ff4d4f; }
 
 .st-toast {
   position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%);

@@ -2,9 +2,16 @@
 (function() {
   const { apiFetch, esc, openDialog, closeDialog, toast } = window.StudioApp;
 
-  let gallery = null, photos = [], sel = new Set(), cur = 0;
+  let gallery = null, photos = [], resultPhotos = [], sel = new Set(), cur = 0;
   let statusData = { status: 'unstarted', selectedIds: [], note: '' };
-  let isLocked = false, saveTimeout = null, observer = null, inResultView = false;
+  let isLocked = false, inResultView = false;
+
+  // D2: Peta id -> elemen kartu agar toggle/pilih semua tidak membangun ulang DOM
+  const cardMap = new Map();
+
+  // D5: State autosave pintar
+  let idSaveTimer = null, noteSaveTimer = null, retryTimer = null;
+  let dirtyIds = false, dirtyNote = false, isSaving = false, retryCount = 0;
 
   const $ = id => document.getElementById(id);
 
@@ -50,13 +57,35 @@
       isLocked = statusData.status === 'submitted';
 
       renderApp();
-
-      photos = await apiFetch('/client/photos');
-      $('st-status').textContent = photos.length ? `${photos.length} foto ditemukan.` : 'Belum ada foto di folder ini.';
-      renderSkeleton();
-
+      await loadPhotos();
     } catch (err) {
       renderError(err.message || 'Gagal memuat galeri.');
+    }
+  }
+
+  // B4 & D7: Muat daftar foto dengan penanganan khusus saat Drive tidak tersedia (503)
+  async function loadPhotos() {
+    const statusEl = $('st-status');
+    if (statusEl) {
+      statusEl.innerHTML = 'Memuat daftar foto...';
+    }
+    try {
+      photos = await apiFetch('/client/photos');
+      if (statusEl) {
+        statusEl.textContent = photos.length ? `${photos.length} foto ditemukan.` : 'Belum ada foto di folder ini.';
+      }
+      renderSkeleton();
+    } catch (err) {
+      if (statusEl) {
+        statusEl.innerHTML = `
+          <div class="st-banner" style="justify-content: space-between; flex-wrap: wrap; border-color: #ff4d4f;">
+            <span style="color: #ff4d4f;">⚠️ ${esc(err.message || 'Daftar foto belum bisa dimuat. Coba lagi sebentar.')}</span>
+            <button type="button" class="st-btn st-btn-outline" id="st-retryPhotosBtn" style="height: 36px; font-size: 14px; padding: 0 16px;">↻ Coba Lagi</button>
+          </div>
+        `;
+        const retryBtn = $('st-retryPhotosBtn');
+        if (retryBtn) retryBtn.onclick = () => loadPhotos();
+      }
     }
   }
 
@@ -105,6 +134,7 @@
         <div class="st-bottom-bar-title">
           <span id="st-count" aria-live="polite">0 foto dipilih</span>
           <div class="st-bottom-bar-progress" id="st-progressWrap" style="display: none;"><div class="st-bottom-bar-progress-fill" id="st-progressFill"></div></div>
+          <span id="st-saveStatus" class="st-save-status" aria-live="polite"></span>
         </div>
         <div class="st-bottom-bar-actions">
           <button class="st-btn st-btn-outline" id="st-allBtn">Pilih semua</button>
@@ -160,6 +190,13 @@
     checkStatus();
   }
 
+  function setSaveStatus(text, stateClass = '') {
+    const el = $('st-saveStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'st-save-status' + (stateClass ? ' ' + stateClass : '');
+  }
+
   function checkStatus() {
     if (inResultView) return;
     isLocked = statusData.status === 'submitted';
@@ -209,108 +246,171 @@
     }
   }
 
-  function autoSave() {
+  // D5: Autosave pintar (ID debounce 400ms, catatan debounce 1500ms, hanya kirim field yang berubah, retry eksponensial, keepalive flush)
+  function scheduleSaveIds() {
     if (isLocked) return;
-    clearTimeout(saveTimeout);
     statusData.selectedIds = [...sel];
-    saveTimeout = setTimeout(() => {
-      if (isLocked) return;
-      apiFetch('/client/selection', {
+    dirtyIds = true;
+    setSaveStatus('Menyimpan…', 'st-saving');
+    if (idSaveTimer) clearTimeout(idSaveTimer);
+    idSaveTimer = setTimeout(() => flushAutoSave(false), 400);
+  }
+
+  function scheduleSaveNote() {
+    if (isLocked) return;
+    dirtyNote = true;
+    setSaveStatus('Menyimpan…', 'st-saving');
+    if (noteSaveTimer) clearTimeout(noteSaveTimer);
+    noteSaveTimer = setTimeout(() => flushAutoSave(false), 1500);
+  }
+
+  async function flushAutoSave(useKeepalive = false) {
+    if (isLocked || (!dirtyIds && !dirtyNote)) return;
+    if (idSaveTimer) { clearTimeout(idSaveTimer); idSaveTimer = null; }
+    if (noteSaveTimer) { clearTimeout(noteSaveTimer); noteSaveTimer = null; }
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+
+    const payload = {};
+    const sendingIds = dirtyIds;
+    const sendingNote = dirtyNote;
+
+    if (sendingIds) payload.ids = [...sel];
+    if (sendingNote) payload.note = statusData.note;
+
+    dirtyIds = false;
+    dirtyNote = false;
+
+    if (useKeepalive) {
+      const config = window.StudioConfig || {};
+      const token = sessionStorage.getItem('st_token') || localStorage.getItem('st_token') || '';
+      try {
+        fetch((config.apiBase || '') + '/client/selection', {
+          method: 'PUT',
+          keepalive: true,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Studio-Token': token
+          },
+          body: JSON.stringify(payload)
+        });
+      } catch (e) {}
+      return;
+    }
+
+    if (isSaving) {
+      if (sendingIds) dirtyIds = true;
+      if (sendingNote) dirtyNote = true;
+      return;
+    }
+
+    isSaving = true;
+    setSaveStatus('Menyimpan…', 'st-saving');
+
+    try {
+      await apiFetch('/client/selection', {
         method: 'PUT',
-        body: JSON.stringify({ ids: statusData.selectedIds, note: statusData.note })
-      }).catch(e => console.error(e));
-    }, 500);
+        body: JSON.stringify(payload)
+      });
+      retryCount = 0;
+      isSaving = false;
+      if (dirtyIds || dirtyNote) {
+        flushAutoSave(false);
+      } else {
+        setSaveStatus('Tersimpan ✓', 'st-saved');
+      }
+    } catch (err) {
+      isSaving = false;
+      if (sendingIds) dirtyIds = true;
+      if (sendingNote) dirtyNote = true;
+      retryCount = Math.min(retryCount + 1, 4);
+      const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 8000);
+      setSaveStatus('Gagal menyimpan, mencoba lagi…', 'st-save-err');
+      retryTimer = setTimeout(() => flushAutoSave(false), delay);
+    }
+  }
+
+  // D2, D3, D7: Render grid sekali per mode tampilan, img native lazy + fetchpriority, 1x fallback + tombol retry per kartu
+  function attachCardImage(card, pItem, i) {
+    let img = card.querySelector('img');
+    if (img) img.remove();
+
+    img = document.createElement('img');
+    img.width = 400;
+    img.height = 400;
+    img.decoding = 'async';
+    img.referrerPolicy = 'no-referrer';
+    img.alt = pItem.name || '';
+    if (i < 12) {
+      img.loading = 'eager';
+      img.fetchPriority = 'high';
+    } else {
+      img.loading = 'lazy';
+      img.fetchPriority = 'low';
+    }
+
+    img.onload = () => {
+      card.classList.remove('st-img-error');
+      card.classList.add('st-img-loaded');
+    };
+    img.onerror = () => {
+      const isDemo = String(pItem.id).startsWith('demo');
+      if (!isDemo && !img.dataset.fallbackTried && pItem.fallbackSrc && img.src !== pItem.fallbackSrc) {
+        img.dataset.fallbackTried = '1';
+        img.src = pItem.fallbackSrc;
+      } else {
+        card.classList.add('st-img-error');
+      }
+    };
+    img.src = pItem.src;
+    card.prepend(img);
   }
 
   function renderSkeleton(forceResultPhotos = null) {
     const isResult = Array.isArray(forceResultPhotos);
     const list = isResult ? forceResultPhotos : photos;
-    $('st-grid').innerHTML = '';
+    const grid = $('st-grid');
+    grid.innerHTML = '';
+    cardMap.clear();
 
+    const frag = document.createDocumentFragment();
     list.forEach((p, i) => {
       const c = document.createElement('div');
       c.className = 'st-photo-card' + (!isResult && sel.has(p.id) ? ' st-selected' : '');
       c.dataset.i = i;
+      c.dataset.id = p.id;
       c.innerHTML = `
+        <div class="st-img-retry-wrap">
+          <span>Gagal memuat pratinjau</span>
+          <button type="button" class="st-retry-img-btn" data-i="${i}">↻ Muat ulang</button>
+        </div>
         <div class="st-photo-card__overlay"></div>
         ${isResult ? '' : '<div class="st-badge-check">✓</div>'}
         <div class="st-badge-name" title="${esc(p.name)}">${esc(p.name)}</div>
         <button class="st-zoom-btn" type="button" aria-label="Perbesar" tabindex="-1">⤢</button>
       `;
-      c.onclick = (e) => {
-        if (e.target.closest('.st-zoom-btn') || isResult) {
-          openLb(i, list, isResult);
-        } else {
-          toggle(p.id, c);
-        }
-      };
-      $('st-grid').append(c);
+      attachCardImage(c, p, i);
+      if (!isResult) {
+        cardMap.set(p.id, c);
+      }
+      frag.appendChild(c);
     });
 
-    if (observer) observer.disconnect();
-    observer = new IntersectionObserver((entries, obs) => {
-      entries.forEach(ent => {
-        if (ent.isIntersecting) {
-          const card = ent.target;
-          const idx = parseInt(card.dataset.i, 10);
-          if (!card.querySelector('img') && list[idx]) {
-            const pItem = list[idx];
-            const img = document.createElement('img');
-            img.referrerPolicy = 'no-referrer';
-            img.alt = pItem.name || '';
-            img.loading = 'lazy';
-            img.onload = () => {
-              card.classList.remove('st-img-error');
-              card.classList.add('st-img-loaded');
-            };
-            img.onerror = () => {
-              const isDemo = String(pItem.id).startsWith('demo');
-              if (!isDemo && !img.dataset.fallbackStage) {
-                img.dataset.fallbackStage = '1';
-                img.src = pItem.fallbackSrc || `https://lh3.googleusercontent.com/d/${encodeURIComponent(pItem.id)}=w400`;
-              } else if (!isDemo && img.dataset.fallbackStage === '1') {
-                img.dataset.fallbackStage = '2';
-                img.src = `https://drive.google.com/thumbnail?id=${encodeURIComponent(pItem.id)}&sz=w400`;
-              } else {
-                card.classList.add('st-img-error');
-              }
-            };
-            img.src = pItem.src;
-            card.prepend(img);
-          }
-          obs.unobserve(card);
-        }
-      });
-    }, { rootMargin: '600px' });
-
-    Array.from($('st-grid').children).forEach(el => observer.observe(el));
+    grid.appendChild(frag);
     if (!isResult) {
       checkStatus();
-      updateOpacity();
     }
+    updateOpacity();
   }
 
+  // D2: Opacity cukup toggle 1 class pada #st-grid
   function updateOpacity() {
-    if (inResultView) return;
-    if (!gallery.maxSelect) {
-      Array.from($('st-grid').children).forEach(c => {
-        c.style.opacity = '1';
-      });
-      return;
-    }
-    const over = sel.size >= gallery.maxSelect;
-    Array.from($('st-grid').children).forEach((c, i) => {
-      if (!photos[i]) return;
-      const id = photos[i].id;
-      if (over && !sel.has(id)) {
-        c.style.opacity = '0.45';
-      } else {
-        c.style.opacity = '1';
-      }
-    });
+    const grid = $('st-grid');
+    if (!grid) return;
+    const limitReached = !inResultView && Boolean(gallery && gallery.maxSelect && sel.size >= gallery.maxSelect);
+    grid.classList.toggle('st-limit-reached', limitReached);
   }
 
-  function toggle(id, el) {
+  function toggle(id) {
     if (isLocked) {
       toast('Pilihan sudah dikunci oleh sistem');
       return;
@@ -319,10 +419,15 @@
       toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`);
       return;
     }
-    sel.has(id) ? sel.delete(id) : sel.add(id);
-    if (el) el.classList.toggle('st-selected', sel.has(id));
+    const willSelect = !sel.has(id);
+    if (willSelect) sel.add(id);
+    else sel.delete(id);
+
+    const cardEl = cardMap.get(id);
+    if (cardEl) cardEl.classList.toggle('st-selected', willSelect);
+
     updateOpacity();
-    autoSave();
+    scheduleSaveIds();
     checkStatus();
     if ($('st-lb').classList.contains('st-open')) updateLbBtn();
   }
@@ -339,31 +444,44 @@
     showLb();
   }
 
+  // D6: Prefetch tetangga kiri/kanan pada w=1600 dan pakai srcLg
+  function prefetchLbNeighbors() {
+    if (!currentLbList || currentLbList.length <= 1) return;
+    const len = currentLbList.length;
+    [(cur + 1) % len, (cur - 1 + len) % len].forEach(idx => {
+      const item = currentLbList[idx];
+      if (item && (item.srcLg || item.src)) {
+        const pre = new Image();
+        pre.referrerPolicy = 'no-referrer';
+        pre.src = item.srcLg || item.src;
+      }
+    });
+  }
+
   function showLb() {
     const p = currentLbList[cur];
     if (!p) return;
     const lbImg = $('st-lbimg');
     lbImg.referrerPolicy = 'no-referrer';
-    delete lbImg.dataset.fallbackStage;
+    delete lbImg.dataset.fallbackTried;
     lbImg.onerror = () => {
       const isDemo = String(p.id).startsWith('demo');
-      if (!isDemo && !lbImg.dataset.fallbackStage) {
-        lbImg.dataset.fallbackStage = '1';
-        lbImg.src = `https://lh3.googleusercontent.com/d/${encodeURIComponent(p.id)}=w1600`;
-      } else if (!isDemo && lbImg.dataset.fallbackStage === '1') {
-        lbImg.dataset.fallbackStage = '2';
-        lbImg.src = `https://drive.google.com/thumbnail?id=${encodeURIComponent(p.id)}&sz=w1600`;
+      const fb = p.fallbackSrcLg || `https://lh3.googleusercontent.com/d/${encodeURIComponent(p.id)}=w1600`;
+      if (!isDemo && !lbImg.dataset.fallbackTried && lbImg.src !== fb) {
+        lbImg.dataset.fallbackTried = '1';
+        lbImg.src = fb;
       }
     };
-    lbImg.src = p.src.replace('w=400', 'w=1600');
+    lbImg.src = p.srcLg || p.src;
     $('st-lbname').textContent = p.name;
+    prefetchLbNeighbors();
 
     if (currentLbResultMode) {
       $('st-lbselBtn').style.display = 'none';
-      const isDemo = String(p.id).startsWith('demo_');
+      const isDemo = String(p.id).startsWith('demo');
       $('st-lbDownloadBtn').style.display = 'inline-flex';
       $('st-lbDownloadBtn').href = isDemo
-        ? p.src.replace('w=400', 'w=1600')
+        ? (p.srcLg || p.src)
         : `https://drive.google.com/uc?export=download&id=${encodeURIComponent(p.id)}`;
     } else {
       $('st-lbselBtn').style.display = 'inline-flex';
@@ -394,23 +512,65 @@
   }
 
   function bindEvents() {
+    // D1: Satu event delegation pada #st-grid
+    $('st-grid').addEventListener('click', (e) => {
+      const retryBtn = e.target.closest('.st-retry-img-btn');
+      if (retryBtn) {
+        e.stopPropagation();
+        const card = retryBtn.closest('.st-photo-card');
+        if (!card) return;
+        const idx = parseInt(card.dataset.i, 10);
+        const list = inResultView ? resultPhotos : photos;
+        if (list[idx]) {
+          card.classList.remove('st-img-error');
+          attachCardImage(card, list[idx], idx);
+        }
+        return;
+      }
+
+      const card = e.target.closest('.st-photo-card');
+      if (!card) return;
+      const idx = parseInt(card.dataset.i, 10);
+      const list = inResultView ? resultPhotos : photos;
+      if (!list[idx]) return;
+
+      if (e.target.closest('.st-zoom-btn') || inResultView) {
+        openLb(idx, list, inResultView);
+      } else {
+        toggle(list[idx].id);
+      }
+    });
+
+    // D2: Pilih semua & Hapus pilihan tanpa renderSkeleton ulang
     $('st-allBtn').onclick = () => {
       if (isLocked) return;
       if (gallery.maxSelect && photos.length > gallery.maxSelect) {
         toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`);
         return;
       }
-      photos.forEach(p => sel.add(p.id));
-      autoSave();
-      renderSkeleton();
+      photos.forEach(p => {
+        if (!sel.has(p.id)) {
+          sel.add(p.id);
+          const el = cardMap.get(p.id);
+          if (el) el.classList.add('st-selected');
+        }
+      });
+      updateOpacity();
+      scheduleSaveIds();
+      checkStatus();
     };
 
     $('st-resetBtn').onclick = () => {
       if (isLocked) return;
       if (sel.size && confirm('Hapus semua pilihan foto?')) {
+        sel.forEach(id => {
+          const el = cardMap.get(id);
+          if (el) el.classList.remove('st-selected');
+        });
         sel.clear();
-        autoSave();
-        renderSkeleton();
+        updateOpacity();
+        scheduleSaveIds();
+        checkStatus();
       }
     };
 
@@ -425,7 +585,9 @@
       $('st-lb').classList.remove('st-open');
       $('st-lbimg').src = '';
     };
-    $('st-lbselBtn').onclick = () => toggle(currentLbList[cur].id, $('st-grid').children[cur]);
+    $('st-lbselBtn').onclick = () => {
+      if (currentLbList[cur]) toggle(currentLbList[cur].id);
+    };
 
     let touchStartX = 0;
     $('st-lbContent').addEventListener('touchstart', e => {
@@ -449,7 +611,17 @@
 
     $('st-note').addEventListener('input', () => {
       statusData.note = $('st-note').value;
-      autoSave();
+      scheduleSaveNote();
+    });
+
+    // D5: Flush dengan keepalive saat tab ditutup / disembunyikan
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        flushAutoSave(true);
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      flushAutoSave(true);
     });
 
     $('st-sendBtn').onclick = () => {
@@ -464,7 +636,12 @@
     $('st-closeSuccessBtn').onclick = () => closeDialog('st-dlg');
 
     $('st-confirmSubmitBtn').onclick = async () => {
-      clearTimeout(saveTimeout);
+      if (idSaveTimer) { clearTimeout(idSaveTimer); idSaveTimer = null; }
+      if (noteSaveTimer) { clearTimeout(noteSaveTimer); noteSaveTimer = null; }
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      dirtyIds = false;
+      dirtyNote = false;
+
       $('st-confirmSubmitBtn').disabled = true;
       try {
         const note = $('st-note').value;
@@ -475,8 +652,9 @@
         statusData.status = 'submitted';
         statusData.note = note;
         isLocked = true;
+        setSaveStatus('Terkirim ✓', 'st-saved');
         checkStatus();
-        renderSkeleton();
+        updateOpacity();
 
         $('st-dlgForm').style.display = 'none';
         $('st-dlgSuccess').style.display = 'block';
@@ -502,10 +680,11 @@
         try {
           const res = await apiFetch('/client/result');
           inResultView = true;
+          resultPhotos = Array.isArray(res.files) ? res.files : [];
           $('st-title').textContent = 'Hasil Edit: ' + gallery.title;
           $('st-subtitle').textContent = 'Ketuk foto untuk memperbesar atau mengunduh hasil edit.';
           const isDemoFolder = !res.folderId || String(res.folderId).startsWith('demo');
-          const filesCount = Array.isArray(res.files) ? res.files.length : 0;
+          const filesCount = resultPhotos.length;
 
           $('st-status').innerHTML = `
             <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px;">
@@ -520,7 +699,7 @@
           $('st-bottomBar').style.display = 'none';
           $('st-bannerContainer').style.display = 'none';
           if ($('st-resultBanner')) $('st-resultBanner').style.display = 'none';
-          renderSkeleton(res.files || []);
+          renderSkeleton(resultPhotos);
         } catch (e) {
           toast(e.message);
         } finally {
@@ -533,3 +712,4 @@
 
   init();
 })();
+

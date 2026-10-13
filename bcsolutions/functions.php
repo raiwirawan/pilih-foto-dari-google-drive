@@ -937,7 +937,7 @@ require_once __DIR__ . '/inc/bcs-wc-ui.php';     // WC order UI + store coming s
 
 // ===== STUDIO START =====
 
-// 5.1 Konstanta dan konfigurasi
+// 5.1 Konstanta, helper umum, dan cache URL halaman
 if (!defined('STUDIO_ASSETS_DIR')) {
     define('STUDIO_ASSETS_DIR', get_stylesheet_directory() . '/studio-assets/');
 }
@@ -945,33 +945,76 @@ if (!defined('STUDIO_ASSETS_URL')) {
     define('STUDIO_ASSETS_URL', get_stylesheet_directory_uri() . '/studio-assets/');
 }
 
+function studio_log($message, $context = []) {
+    if (defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
+        $ctx = !empty($context) ? ' ' . wp_json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : '';
+        error_log('[Studio] ' . $message . $ctx);
+    }
+}
+
 function studio_is_studio_page() {
     return is_page_template('template-studio-editor.php') || is_page_template('template-studio-client.php');
 }
 
 function studio_build_page_url($template_name, $query_args = []) {
-    $pages = get_pages([
-        'meta_key' => '_wp_page_template',
-        'meta_value' => $template_name,
-        'post_status' => 'publish'
-    ]);
-    if (empty($pages)) {
+    static $memo = [];
+    if (!isset($memo[$template_name])) {
+        $t_key = 'studio_page_url_' . md5($template_name);
+        $cached = get_transient($t_key);
+        if (is_string($cached)) {
+            $memo[$template_name] = $cached;
+        } else {
+            $pages = get_pages([
+                'meta_key' => '_wp_page_template',
+                'meta_value' => $template_name,
+                'post_status' => 'publish',
+                'number' => 1
+            ]);
+            $url = !empty($pages) ? (string) get_permalink($pages[0]->ID) : '';
+            $memo[$template_name] = $url;
+            set_transient($t_key, $url, 12 * HOUR_IN_SECONDS);
+        }
+    }
+    $base_url = $memo[$template_name];
+    if (!$base_url) {
         return '';
     }
-    $url = get_permalink($pages[0]->ID);
-    if (!$url) {
-        return '';
-    }
-    return !empty($query_args) ? add_query_arg($query_args, $url) : $url;
+    return !empty($query_args) ? add_query_arg($query_args, $base_url) : $base_url;
 }
 
-// 5.2 Database
+function studio_clear_page_url_cache() {
+    delete_transient('studio_page_url_' . md5('template-studio-editor.php'));
+    delete_transient('studio_page_url_' . md5('template-studio-client.php'));
+}
+add_action('save_post_page', 'studio_clear_page_url_cache');
+add_action('deleted_post', 'studio_clear_page_url_cache');
+
+// 5.2 Database v1.1 (studio_galleries + studio_files)
+function studio_ensure_cache_dir() {
+    $upload_dir = wp_upload_dir();
+    $cache_dir = $upload_dir['basedir'] . '/studio-cache';
+    if (!file_exists($cache_dir)) {
+        wp_mkdir_p($cache_dir);
+    }
+    $index_file = $cache_dir . '/index.html';
+    if (!file_exists($index_file)) {
+        @file_put_contents($index_file, '');
+    }
+    $htaccess_file = $cache_dir . '/.htaccess';
+    if (!file_exists($htaccess_file)) {
+        $ht = "Options -Indexes\n<IfModule mod_headers.c>\n  Header set Cache-Control \"public, max-age=2592000, immutable\"\n</IfModule>\n";
+        @file_put_contents($htaccess_file, $ht);
+    }
+    return $cache_dir;
+}
+
 function studio_install_db() {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'studio_galleries';
+    $table_galleries = $wpdb->prefix . 'studio_galleries';
+    $table_files = $wpdb->prefix . 'studio_files';
     $charset_collate = $wpdb->get_charset_collate();
 
-    $sql = "CREATE TABLE $table_name (
+    $sql_galleries = "CREATE TABLE $table_galleries (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
         token char(32) NOT NULL,
         title varchar(150) NOT NULL,
@@ -980,23 +1023,76 @@ function studio_install_db() {
         max_select int(11) NOT NULL DEFAULT 0,
         status varchar(20) NOT NULL DEFAULT 'unstarted',
         selected_ids longtext NOT NULL,
+        selected_meta longtext NULL,
+        selected_count int(10) unsigned NOT NULL DEFAULT 0,
         note text,
         created_at datetime DEFAULT CURRENT_TIMESTAMP,
         updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         submitted_at datetime DEFAULT NULL,
         reopened_at datetime DEFAULT NULL,
         PRIMARY KEY  (id),
-        UNIQUE KEY token (token)
+        UNIQUE KEY token (token),
+        KEY status (status),
+        KEY updated_at (updated_at)
     ) $charset_collate;";
 
-    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
-    dbDelta($sql);
-    update_option('studio_db_version', '1.0');
+    $sql_files = "CREATE TABLE $table_files (
+        file_id varchar(100) NOT NULL,
+        folder_id varchar(100) NOT NULL,
+        name varchar(255) NOT NULL,
+        mime varchar(100) NOT NULL DEFAULT '',
+        thumb_link text NULL,
+        position int(10) unsigned NOT NULL DEFAULT 0,
+        synced_at datetime NOT NULL,
+        PRIMARY KEY  (folder_id, file_id),
+        KEY file_id (file_id)
+    ) $charset_collate;";
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta($sql_galleries);
+    dbDelta($sql_files);
+
+    // Hitung selected_count awal untuk baris galeri lama jika masih 0
+    $legacy_rows = $wpdb->get_results("SELECT id, selected_ids, selected_count FROM $table_galleries");
+    if ($legacy_rows) {
+        foreach ($legacy_rows as $r) {
+            $ids = json_decode((string) $r->selected_ids, true);
+            $cnt = is_array($ids) ? count($ids) : 0;
+            if ((int) $r->selected_count !== $cnt) {
+                $wpdb->update($table_galleries, ['selected_count' => $cnt], ['id' => $r->id]);
+            }
+        }
+    }
+
+    // E5: Bersihkan transient lama sekali jalan
+    $wpdb->query(
+        "DELETE FROM {$wpdb->options}
+         WHERE option_name LIKE '_transient_studio_drive_v3_%'
+            OR option_name LIKE '_transient_timeout_studio_drive_v3_%'
+            OR option_name LIKE '_transient_studio_fmeta_%'
+            OR option_name LIKE '_transient_timeout_studio_fmeta_%'
+            OR option_name LIKE '_transient_studio_tmap_%'
+            OR option_name LIKE '_transient_timeout_studio_tmap_%'"
+    );
+
+    studio_ensure_cache_dir();
+    update_option('studio_db_version', '1.1');
 }
 
 add_action('init', function() {
-    if (get_option('studio_db_version') !== '1.0') {
+    if (get_option('studio_db_version') !== '1.1') {
         studio_install_db();
+    }
+    if (!get_option('studio_cron_installed')) {
+        if (!wp_next_scheduled('studio_clean_cache_cron')) {
+            wp_schedule_event(time(), 'daily', 'studio_clean_cache_cron');
+        }
+        update_option('studio_cron_installed', 1, 'yes');
+    }
+    if (!get_option('studio_names_backfilled')) {
+        if (!wp_next_scheduled('studio_run_backfill_names')) {
+            wp_schedule_single_event(time() + 2, 'studio_run_backfill_names');
+        }
     }
 });
 
@@ -1047,13 +1143,18 @@ function studio_verify_editor(WP_REST_Request $request) {
     return new WP_Error('unauthorized', 'Kunci editor tidak valid atau sudah diganti.', ['status' => 401]);
 }
 
-// Pastikan seluruh response REST API studio/v1 tidak di-cache oleh browser/CDN/LiteSpeed
+// C9: Header respons REST API studio/v1 (dukung ETag/304 khusus /client/photos dan /client/result, lainnya no-store)
 add_filter('rest_post_dispatch', function($response, $server, $request) {
     $route = $request->get_route();
     if (strpos($route, '/studio/v1') === 0 && $response instanceof WP_REST_Response) {
-        $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-        $response->header('Pragma', 'no-cache');
-        $response->header('Expires', '0');
+        $headers = $response->get_headers();
+        if (($route === '/studio/v1/client/photos' || $route === '/studio/v1/client/result') && !empty($headers['ETag'])) {
+            $response->header('Cache-Control', 'private, no-cache, must-revalidate');
+        } else {
+            $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+            $response->header('Pragma', 'no-cache');
+            $response->header('Expires', '0');
+        }
     }
     return $response;
 }, 10, 3);
@@ -1080,6 +1181,13 @@ add_action('rest_api_init', function() {
             $url = studio_build_page_url('template-studio-editor.php', ['key' => $key]);
             return rest_ensure_response(['key' => $key, 'url' => $url]);
         },
+        'permission_callback' => function() { return current_user_can('manage_options'); }
+    ]);
+
+    // Fase A: Endpoint Diagnostik Drive API (Khusus Admin)
+    register_rest_route('studio/v1', '/editor/diagnostics', [
+        'methods' => 'GET',
+        'callback' => 'studio_api_editor_diagnostics',
         'permission_callback' => function() { return current_user_can('manage_options'); }
     ]);
 
@@ -1119,6 +1227,16 @@ add_action('rest_api_init', function() {
         'callback' => 'studio_api_editor_regenerate_token',
         'permission_callback' => 'studio_verify_editor'
     ]);
+    register_rest_route('studio/v1', '/editor/galleries/(?P<id>\d+)/resync', [
+        'methods' => 'POST',
+        'callback' => 'studio_api_editor_resync_gallery',
+        'permission_callback' => 'studio_verify_editor'
+    ]);
+    register_rest_route('studio/v1', '/editor/galleries/(?P<id>\d+)/warm-thumbs', [
+        'methods' => 'POST',
+        'callback' => 'studio_api_editor_warm_thumbs',
+        'permission_callback' => 'studio_verify_editor'
+    ]);
     register_rest_route('studio/v1', '/editor/drive/resolve', [
         'methods' => 'POST',
         'callback' => 'studio_api_editor_drive_resolve',
@@ -1156,7 +1274,7 @@ add_action('rest_api_init', function() {
         'permission_callback' => 'studio_verify_client'
     ]);
     register_rest_route('studio/v1', '/client/selection', [
-        'methods' => 'PUT',
+        'methods' => ['PUT', 'POST'],
         'callback' => 'studio_api_client_update_selection',
         'permission_callback' => 'studio_verify_client'
     ]);
@@ -1197,7 +1315,7 @@ add_action('http_api_curl', function($handle, $parsed_args, $url) {
     }
 }, 10, 3);
 
-// Helper HTTP GET ke Google yang tahan kendala SSL lokal maupun restriksi Referer
+// C7: Helper HTTP GET ke Google tanpa retry sslverify=false di produksi dan tanpa retry saat timeout
 function studio_remote_get($url, $args = []) {
     $default_args = [
         'timeout' => 15,
@@ -1214,10 +1332,13 @@ function studio_remote_get($url, $args = []) {
 
     $resp = wp_remote_get($url, $req_args);
 
-    // Retry dengan sslverify=false jika gagal karena sertifikat SSL lokal
-    if (is_wp_error($resp)) {
-        $req_args['sslverify'] = false;
-        $resp = wp_remote_get($url, $req_args);
+    // Retry sslverify=false HANYA di environment local dan bukan error timeout
+    if (is_wp_error($resp) && function_exists('wp_get_environment_type') && wp_get_environment_type() === 'local') {
+        $err_msg = $resp->get_error_message();
+        if (stripos($err_msg, 'timed out') === false && stripos($err_msg, 'timeout') === false) {
+            $req_args['sslverify'] = false;
+            $resp = wp_remote_get($url, $req_args);
+        }
     }
 
     // Jika ditolak 403 dan belum menyertakan Referer, coba ulang dengan Referer situs
@@ -1247,48 +1368,129 @@ function studio_make_demo_photo($i, $folder_id) {
     return [
         'id' => 'demo' . $i . $folder_id,
         'name' => $name,
+        'mime' => 'image/svg+xml',
         'thumbnailLink' => 'data:image/svg+xml,' . rawurlencode($svg)
     ];
 }
 
-// Drive API helper
-function studio_get_drive_photos($folder_id, $force_refresh = false) {
+// C1 & C2: Daftar putih lebar thumbnail, path cache statis, dan URL bertanda tangan stabil harian
+function studio_allowed_widths() {
+    return [200, 400, 800, 1600];
+}
+
+function studio_snap_width($w) {
+    $w = (int) $w;
+    $allowed = studio_allowed_widths();
+    $best = 400;
+    $min_diff = PHP_INT_MAX;
+    foreach ($allowed as $aw) {
+        $diff = abs($w - $aw);
+        if ($diff < $min_diff) {
+            $min_diff = $diff;
+            $best = $aw;
+        }
+    }
+    return $best;
+}
+
+function studio_thumb_cache_info($file_id, $w) {
+    $w = studio_snap_width($w);
+    $hash = substr(hash_hmac('sha256', "$file_id|$w", wp_salt('auth')), 0, 32);
+    $shard = substr($hash, 0, 2);
+    $upload_dir = wp_upload_dir();
+    $rel = "/studio-cache/{$shard}/{$hash}.jpg";
+    return [
+        'w' => $w,
+        'hash' => $hash,
+        'shard' => $shard,
+        'dir' => $upload_dir['basedir'] . "/studio-cache/{$shard}",
+        'path' => $upload_dir['basedir'] . $rel,
+        'url' => $upload_dir['baseurl'] . $rel,
+    ];
+}
+
+function studio_sign_url($file_id, $w, $folder_id = '') {
+    if (strpos($file_id, 'demo') === 0) return '';
+    $w = studio_snap_width($w);
+    $exp = (intdiv(time(), DAY_IN_SECONDS) + 3) * DAY_IN_SECONDS;
+    $sig = hash_hmac('sha256', "$file_id|$w|$exp", wp_salt('auth'));
+    $args = [
+        'studio_thumb' => $file_id,
+        'w' => $w,
+        'exp' => $exp,
+        'sig' => $sig
+    ];
+    if (!empty($folder_id)) {
+        $args['f'] = $folder_id;
+    }
+    return add_query_arg($args, home_url('/'));
+}
+
+function studio_get_thumb_url($file_id, $w, $folder_id = '') {
+    if (strpos($file_id, 'demo') === 0) return '';
+    $info = studio_thumb_cache_info($file_id, $w);
+    if (file_exists($info['path']) && filesize($info['path']) > 100) {
+        return $info['url'];
+    }
+    return studio_sign_url($file_id, $info['w'], $folder_id);
+}
+
+// B2: Sinkronisasi penuh folder Google Drive ke tabel persisten studio_files
+function studio_sync_folder($folder_id) {
+    global $wpdb;
     if (empty($folder_id)) {
-        return [];
+        return new WP_Error('empty_folder', 'ID folder kosong.');
     }
 
+    $table_files = $wpdb->prefix . 'studio_files';
+    $sync_time = current_time('mysql');
+
+    // Mode Demo bila STUDIO_GOOGLE_API_KEY belum diset
     if (!defined('STUDIO_GOOGLE_API_KEY') || empty(STUDIO_GOOGLE_API_KEY)) {
-        $files = [];
+        $index = [];
         for ($i = 0; $i < 24; $i++) {
-            $files[] = studio_make_demo_photo($i, $folder_id);
+            $d = studio_make_demo_photo($i, $folder_id);
+            $wpdb->replace($table_files, [
+                'file_id' => $d['id'],
+                'folder_id' => $folder_id,
+                'name' => $d['name'],
+                'mime' => $d['mime'],
+                'thumb_link' => $d['thumbnailLink'],
+                'position' => $i,
+                'synced_at' => $sync_time
+            ]);
+            $index[$d['id']] = [
+                'id' => $d['id'],
+                'name' => $d['name'],
+                'mime' => $d['mime'],
+                'thumb_link' => $d['thumbnailLink'],
+                'position' => $i,
+                'synced_at' => $sync_time
+            ];
         }
-        return $files;
+        update_option('studio_sync_' . md5($folder_id), [
+            'time' => time(),
+            'synced_at' => $sync_time,
+            'count' => count($index)
+        ], 'no');
+        return $index;
     }
 
-    $transient_key = 'studio_drive_v3_' . md5($folder_id);
-    $fmeta_key = 'studio_fmeta_' . md5($folder_id);
-    $tmap_key = 'studio_tmap_' . md5($folder_id);
+    $include_octet = (bool) apply_filters('studio_include_octet_stream', (bool) get_option('studio_include_octet_stream', false));
+    $mime_clause = $include_octet
+        ? "(mimeType contains 'image/' or mimeType = 'application/octet-stream')"
+        : "mimeType contains 'image/'";
 
-    if (!$force_refresh) {
-        $cached = get_transient($transient_key);
-        if ($cached !== false && is_array($cached) && !empty($cached)) {
-            return $cached;
-        }
-    }
-
-    $files = [];
-    $thumb_map = is_array(get_transient($tmap_key)) ? get_transient($tmap_key) : [];
-    $fmeta_map = is_array(get_transient($fmeta_key)) ? get_transient($fmeta_key) : [];
+    $raw_files = [];
     $page_token = '';
-    $had_error = false;
 
     do {
-        $q = "'" . $folder_id . "' in parents and mimeType contains 'image/' and trashed=false";
+        $q = "'" . $folder_id . "' in parents and {$mime_clause} and trashed=false";
         $query_args = [
             'q' => $q,
             'pageSize' => 1000,
             'orderBy' => 'name',
-            'fields' => 'nextPageToken,files(id,name,thumbnailLink)',
+            'fields' => 'nextPageToken,files(id,name,mimeType,thumbnailLink)',
             'supportsAllDrives' => 'true',
             'includeItemsFromAllDrives' => 'true',
             'key' => STUDIO_GOOGLE_API_KEY,
@@ -1300,160 +1502,475 @@ function studio_get_drive_photos($folder_id, $force_refresh = false) {
         $url = 'https://www.googleapis.com/drive/v3/files?' . http_build_query($query_args, '', '&', PHP_QUERY_RFC3986);
         $response = studio_remote_get($url, ['timeout' => 15]);
 
-        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
-            $had_error = true;
-            break;
+        if (is_wp_error($response)) {
+            studio_log('Drive files.list WP_Error', [
+                'folder_id' => $folder_id,
+                'error' => $response->get_error_message()
+            ]);
+            return new WP_Error('drive_unavailable', 'Gagal menghubungi Google Drive: ' . $response->get_error_message(), ['status' => 503]);
         }
 
+        $http_code = wp_remote_retrieve_response_code($response);
         $body = json_decode(wp_remote_retrieve_body($response), true);
-        if (!is_array($body) || isset($body['error'])) {
-            $had_error = true;
-            break;
+
+        if ($http_code !== 200 || !is_array($body) || isset($body['error'])) {
+            $err_reason = $body['error']['errors'][0]['reason'] ?? ($body['error']['status'] ?? 'unknown');
+            $err_msg = $body['error']['message'] ?? ('HTTP ' . $http_code);
+            studio_log('Drive files.list HTTP/API error', [
+                'folder_id' => $folder_id,
+                'http_code' => $http_code,
+                'reason' => $err_reason,
+                'message' => $err_msg
+            ]);
+            return new WP_Error('drive_unavailable', 'Daftar foto belum bisa dimuat (' . $err_reason . ').', ['status' => 503]);
         }
 
         foreach (($body['files'] ?? []) as $f) {
-            if (empty($f['id'])) continue;
-            $fid = $f['id'];
-            $fname = !empty($f['name']) ? $f['name'] : $fid;
-            $tUrl = $f['thumbnailLink'] ?? '';
-            if ($tUrl) {
-                $tUrl = preg_replace('/=s\d+.*$/', '', $tUrl);
-                $thumb_map[$fid] = $tUrl;
-            }
-            $fmeta_map[$fid] = [
-                'name' => $fname,
-                'thumbnailLink' => $tUrl
-            ];
-            $files[] = [
-                'id' => $fid,
-                'name' => $fname,
-                'thumbnailLink' => $tUrl
+            if (empty($f['id']) || empty($f['name'])) continue;
+            $tUrl = !empty($f['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $f['thumbnailLink']) : '';
+            $raw_files[] = [
+                'id' => (string) $f['id'],
+                'name' => (string) $f['name'],
+                'mime' => (string) ($f['mimeType'] ?? ''),
+                'thumb_link' => $tUrl
             ];
         }
 
         $page_token = $body['nextPageToken'] ?? '';
     } while ($page_token);
 
-    if (!empty($thumb_map)) {
-        set_transient($tmap_key, $thumb_map, 7 * DAY_IN_SECONDS);
-    }
-    if (!empty($fmeta_map)) {
-        set_transient($fmeta_key, $fmeta_map, 7 * DAY_IN_SECONDS);
+    // Tulis ke studio_files per batch (INSERT ... ON DUPLICATE KEY UPDATE)
+    $index = [];
+    $chunks = array_chunk($raw_files, 200);
+    $pos = 0;
+
+    foreach ($chunks as $chunk) {
+        $values_sql = [];
+        $params = [];
+        foreach ($chunk as $item) {
+            $values_sql[] = '(%s, %s, %s, %s, %s, %d, %s)';
+            $params[] = $item['id'];
+            $params[] = $folder_id;
+            $params[] = $item['name'];
+            $params[] = $item['mime'];
+            $params[] = $item['thumb_link'];
+            $params[] = $pos;
+            $params[] = $sync_time;
+
+            $index[$item['id']] = [
+                'id' => $item['id'],
+                'name' => $item['name'],
+                'mime' => $item['mime'],
+                'thumb_link' => $item['thumb_link'],
+                'position' => $pos,
+                'synced_at' => $sync_time
+            ];
+            $pos++;
+        }
+
+        $sql = "INSERT INTO {$table_files} (file_id, folder_id, name, mime, thumb_link, position, synced_at)
+                VALUES " . implode(', ', $values_sql) . "
+                ON DUPLICATE KEY UPDATE
+                    name = VALUES(name),
+                    mime = VALUES(mime),
+                    thumb_link = IF(VALUES(thumb_link) != '', VALUES(thumb_link), thumb_link),
+                    position = VALUES(position),
+                    synced_at = VALUES(synced_at)";
+        $wpdb->query($wpdb->prepare($sql, $params));
     }
 
-    if (!$had_error && !empty($files)) {
-        set_transient($transient_key, $files, 5 * MINUTE_IN_SECONDS);
-    } elseif (empty($files) && !empty($fmeta_map)) {
-        // Jika koneksi API sedang gagal sementara, rekonstruksi daftar dari metadata terakhir yang tersimpan
-        foreach ($fmeta_map as $fid => $meta) {
-            $files[] = [
-                'id' => $fid,
-                'name' => $meta['name'] ?? $fid,
-                'thumbnailLink' => $meta['thumbnailLink'] ?? ''
+    // Hapus baris file yang sudah tidak ada di folder Drive
+    if (empty($raw_files)) {
+        $wpdb->delete($table_files, ['folder_id' => $folder_id]);
+    } else {
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$table_files} WHERE folder_id = %s AND synced_at < %s",
+            $folder_id,
+            $sync_time
+        ));
+    }
+
+    update_option('studio_sync_' . md5($folder_id), [
+        'time' => time(),
+        'synced_at' => $sync_time,
+        'count' => count($index)
+    ], 'no');
+
+    // Perbarui snapshot selected_meta pada galeri yang memakai folder ini
+    if (!empty($index)) {
+        $galleries = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, selected_ids, selected_meta FROM {$wpdb->prefix}studio_galleries WHERE source_folder_id = %s",
+            $folder_id
+        ));
+        foreach ((array) $galleries as $g_row) {
+            $s_ids = studio_sanitize_selected_ids(json_decode((string) $g_row->selected_ids, true) ?: []);
+            if (empty($s_ids)) continue;
+            $s_meta = json_decode((string) ($g_row->selected_meta ?: '{}'), true) ?: [];
+            $changed = false;
+            foreach ($s_ids as $sid) {
+                if (isset($index[$sid]) && (!isset($s_meta[$sid]) || $s_meta[$sid] !== $index[$sid]['name'])) {
+                    $s_meta[$sid] = $index[$sid]['name'];
+                    $changed = true;
+                }
+            }
+            if ($changed || $g_row->selected_meta === null) {
+                $wpdb->update($wpdb->prefix . 'studio_galleries', [
+                    'selected_meta' => wp_json_encode($s_meta, JSON_UNESCAPED_UNICODE),
+                    'selected_count' => count($s_ids)
+                ], ['id' => $g_row->id]);
+            }
+        }
+    }
+
+    // C4: Jadwalkan warm-up thumbnail di background
+    studio_schedule_prefetch_thumbs($folder_id);
+
+    return $index;
+}
+
+// C3: Background resync dengan anti-duplikat lock
+function studio_schedule_resync_folder($folder_id) {
+    $lock_key = 'studio_lock_sync_' . md5($folder_id);
+    $locked_at = (int) get_option($lock_key, 0);
+    if ($locked_at && (time() - $locked_at) < 60) {
+        return;
+    }
+    update_option($lock_key, time(), 'no');
+    if (!wp_next_scheduled('studio_resync_folder', [$folder_id])) {
+        wp_schedule_single_event(time() + 1, 'studio_resync_folder', [$folder_id]);
+    }
+}
+
+add_action('studio_resync_folder', function($folder_id) {
+    $lock_key = 'studio_lock_sync_' . md5($folder_id);
+    studio_sync_folder($folder_id);
+    delete_option($lock_key);
+});
+
+// B3 & C3: Ambil indeks file folder dari tabel studio_files (stale-while-revalidate 5 menit)
+function studio_get_file_index($folder_id, $force_refresh = false, &$is_stale = false) {
+    global $wpdb;
+    $is_stale = false;
+    if (empty($folder_id)) return [];
+
+    $table_files = $wpdb->prefix . 'studio_files';
+    $sync_meta = get_option('studio_sync_' . md5($folder_id));
+
+    if ($force_refresh) {
+        $synced = studio_sync_folder($folder_id);
+        if (!is_wp_error($synced)) {
+            return $synced;
+        }
+    }
+
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT file_id, name, mime, thumb_link, position, synced_at
+         FROM {$table_files}
+         WHERE folder_id = %s
+         ORDER BY position ASC, name ASC",
+        $folder_id
+    ));
+
+    $has_cached_rows = !empty($rows);
+    $has_known_empty_sync = is_array($sync_meta) && isset($sync_meta['count']) && (int) $sync_meta['count'] === 0 && !empty($sync_meta['time']);
+
+    if ($has_cached_rows || $has_known_empty_sync) {
+        $index = [];
+        foreach ((array) $rows as $r) {
+            $index[$r->file_id] = [
+                'id' => $r->file_id,
+                'name' => $r->name,
+                'mime' => $r->mime,
+                'thumb_link' => $r->thumb_link,
+                'position' => (int) $r->position,
+                'synced_at' => $r->synced_at
+            ];
+        }
+
+        $last_time = is_array($sync_meta) && !empty($sync_meta['time']) ? (int) $sync_meta['time'] : 0;
+        if (!$force_refresh && (time() - $last_time) > 5 * MINUTE_IN_SECONDS) {
+            $is_stale = true;
+            studio_schedule_resync_folder($folder_id);
+        }
+
+        return $index;
+    }
+
+    // Sync sinkron sekali jika belum ada data sama sekali di database
+    $synced = studio_sync_folder($folder_id);
+    if (is_wp_error($synced)) {
+        return null;
+    }
+    return $synced;
+}
+
+// B6: Resolve nama paralel (6 sekaligus) via files.get untuk ID yang belum punya nama (tanpa download gambar)
+function studio_resolve_missing_names_parallel(array $file_ids, $folder_id = '') {
+    global $wpdb;
+    $file_ids = array_values(array_unique(array_filter($file_ids, function($id) {
+        return is_string($id) && $id !== '' && strpos($id, 'demo') !== 0;
+    })));
+    if (empty($file_ids)) return [];
+
+    $resolved = [];
+    $table_files = $wpdb->prefix . 'studio_files';
+
+    // Cek dulu di tabel studio_files
+    $placeholders = implode(',', array_fill(0, count($file_ids), '%s'));
+    $db_rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT file_id, name FROM {$table_files} WHERE file_id IN ($placeholders)",
+        $file_ids
+    ));
+    foreach ((array) $db_rows as $r) {
+        if (!empty($r->name) && $r->name !== $r->file_id) {
+            $resolved[$r->file_id] = $r->name;
+        }
+    }
+
+    $missing = array_values(array_diff($file_ids, array_keys($resolved)));
+    if (empty($missing) || !defined('STUDIO_GOOGLE_API_KEY') || empty(STUDIO_GOOGLE_API_KEY)) {
+        return $resolved;
+    }
+
+    $sync_time = current_time('mysql');
+    $batches = array_chunk($missing, 6);
+
+    foreach ($batches as $batch) {
+        if (class_exists('WpOrg\Requests\Requests') || class_exists('Requests')) {
+            $requests = [];
+            foreach ($batch as $fid) {
+                $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($fid) . '?' . http_build_query([
+                    'fields' => 'id,name,mimeType,thumbnailLink',
+                    'supportsAllDrives' => 'true',
+                    'key' => STUDIO_GOOGLE_API_KEY
+                ], '', '&', PHP_QUERY_RFC3986);
+                $requests[$fid] = [
+                    'url' => $url,
+                    'headers' => [
+                        'Accept' => 'application/json',
+                        'Referer' => home_url('/')
+                    ],
+                    'type' => 'GET'
+                ];
+            }
+
+            $options = ['timeout' => 6, 'connect_timeout' => 4];
+            $responses = class_exists('WpOrg\Requests\Requests')
+                ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
+                : \Requests::request_multiple($requests, $options);
+
+            foreach ($responses as $fid => $resp) {
+                if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
+                    $body = json_decode($resp->body, true);
+                    if (!empty($body['name']) && $body['name'] !== $fid) {
+                        $resolved[$fid] = (string) $body['name'];
+                        if ($folder_id) {
+                            $tUrl = !empty($body['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $body['thumbnailLink']) : '';
+                            $wpdb->replace($table_files, [
+                                'file_id' => $fid,
+                                'folder_id' => $folder_id,
+                                'name' => (string) $body['name'],
+                                'mime' => (string) ($body['mimeType'] ?? ''),
+                                'thumb_link' => $tUrl,
+                                'position' => 999999,
+                                'synced_at' => $sync_time
+                            ]);
+                        }
+                    }
+                }
+            }
+        } else {
+            foreach ($batch as $fid) {
+                $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($fid) . '?' . http_build_query([
+                    'fields' => 'id,name,mimeType,thumbnailLink',
+                    'supportsAllDrives' => 'true',
+                    'key' => STUDIO_GOOGLE_API_KEY
+                ], '', '&', PHP_QUERY_RFC3986);
+                $resp = studio_remote_get($url, ['timeout' => 6]);
+                if (!is_wp_error($resp) && wp_remote_retrieve_response_code($resp) === 200) {
+                    $body = json_decode(wp_remote_retrieve_body($resp), true);
+                    if (!empty($body['name']) && $body['name'] !== $fid) {
+                        $resolved[$fid] = (string) $body['name'];
+                    }
+                }
+            }
+        }
+    }
+
+    return $resolved;
+}
+
+// B6: Backfill satu baris galeri dan tulis balik ke selected_meta
+function studio_backfill_gallery_row($g, $force_sync = false) {
+    global $wpdb;
+    $selected_ids = studio_sanitize_selected_ids(json_decode((string) $g->selected_ids, true) ?: []);
+    $old_meta = json_decode((string) ($g->selected_meta ?: '{}'), true) ?: [];
+
+    if (empty($selected_ids)) {
+        if ($g->selected_meta === null || (int) $g->selected_count !== 0) {
+            $wpdb->update($wpdb->prefix . 'studio_galleries', [
+                'selected_meta' => '{}',
+                'selected_count' => 0
+            ], ['id' => $g->id]);
+        }
+        return [];
+    }
+
+    if ($force_sync && !empty($g->source_folder_id)) {
+        studio_sync_folder($g->source_folder_id);
+    } else {
+        studio_get_file_index($g->source_folder_id);
+    }
+
+    $meta = [];
+    $missing_ids = [];
+    foreach ($selected_ids as $sid) {
+        if (strpos($sid, 'demo') === 0 && preg_match('/^demo(\d+)/', $sid, $m)) {
+            $d = studio_make_demo_photo((int) $m[1], $g->source_folder_id);
+            $meta[$sid] = $d['name'];
+        } elseif (!empty($old_meta[$sid]) && $old_meta[$sid] !== $sid) {
+            $meta[$sid] = $old_meta[$sid];
+        } else {
+            $missing_ids[] = $sid;
+        }
+    }
+
+    if (!empty($missing_ids)) {
+        $resolved = studio_resolve_missing_names_parallel($missing_ids, $g->source_folder_id);
+        foreach ($missing_ids as $sid) {
+            if (!empty($resolved[$sid])) {
+                $meta[$sid] = $resolved[$sid];
+            }
+        }
+    }
+
+    $wpdb->update($wpdb->prefix . 'studio_galleries', [
+        'selected_meta' => wp_json_encode($meta, JSON_UNESCAPED_UNICODE),
+        'selected_count' => count($selected_ids)
+    ], ['id' => $g->id]);
+
+    return $meta;
+}
+
+function studio_backfill_names() {
+    global $wpdb;
+    $galleries = $wpdb->get_results("SELECT id, source_folder_id, selected_ids, selected_meta, selected_count FROM {$wpdb->prefix}studio_galleries");
+    foreach ((array) $galleries as $g) {
+        $ids = studio_sanitize_selected_ids(json_decode((string) $g->selected_ids, true) ?: []);
+        $meta = json_decode((string) ($g->selected_meta ?: '{}'), true) ?: [];
+        $needs_backfill = ($g->selected_meta === null);
+        if (!$needs_backfill && !empty($ids)) {
+            foreach ($ids as $sid) {
+                if (empty($meta[$sid]) || $meta[$sid] === $sid) {
+                    $needs_backfill = true;
+                    break;
+                }
+            }
+        }
+        if ($needs_backfill) {
+            studio_backfill_gallery_row($g, false);
+        }
+    }
+    update_option('studio_names_backfilled', 1, 'yes');
+}
+add_action('studio_run_backfill_names', 'studio_backfill_names');
+
+// C4: Warm-up / prefetch thumbnail w=400 secara paralel (6 sekaligus) ke cache statis
+function studio_schedule_prefetch_thumbs($folder_id) {
+    if (empty($folder_id)) return;
+    if (!wp_next_scheduled('studio_warm_thumbs_event', [$folder_id])) {
+        wp_schedule_single_event(time() + 2, 'studio_warm_thumbs_event', [$folder_id]);
+    }
+}
+
+function studio_prefetch_thumbs($folder_id, $max_files = 48) {
+    global $wpdb;
+    if (empty($folder_id)) {
+        return ['total' => 0, 'cached' => 0, 'remaining' => 0];
+    }
+
+    studio_ensure_cache_dir();
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT file_id, thumb_link FROM {$wpdb->prefix}studio_files WHERE folder_id = %s ORDER BY position ASC",
+        $folder_id
+    ));
+
+    $total = count($rows);
+    $cached = 0;
+    $to_fetch = [];
+
+    foreach ((array) $rows as $r) {
+        if (strpos($r->file_id, 'demo') === 0) {
+            $cached++;
+            continue;
+        }
+        $info = studio_thumb_cache_info($r->file_id, 400);
+        if (file_exists($info['path']) && filesize($info['path']) > 100) {
+            $cached++;
+        } else {
+            $to_fetch[] = [
+                'id' => $r->file_id,
+                'thumb_link' => $r->thumb_link,
+                'info' => $info
             ];
         }
     }
 
-    return $files;
-}
-
-// Helper resolusi nama file & thumbnailLink individual jika file tidak ditemukan di listing awal
-function studio_resolve_single_file_meta($file_id, $folder_id = '') {
-    $fmeta_key = $folder_id ? 'studio_fmeta_' . md5($folder_id) : '';
-    $tmap_key = $folder_id ? 'studio_tmap_' . md5($folder_id) : '';
-    $fmeta_map = ($fmeta_key && is_array(get_transient($fmeta_key))) ? get_transient($fmeta_key) : [];
-    $thumb_map = ($tmap_key && is_array(get_transient($tmap_key))) ? get_transient($tmap_key) : [];
-
-    if (!empty($fmeta_map[$file_id]['name']) && $fmeta_map[$file_id]['name'] !== $file_id) {
-        return $fmeta_map[$file_id];
+    if (empty($to_fetch)) {
+        return ['total' => $total, 'cached' => $cached, 'remaining' => 0];
     }
 
-    // Lapis 1: Ambil metadata file dari Google Drive API v3
-    if (defined('STUDIO_GOOGLE_API_KEY') && !empty(STUDIO_GOOGLE_API_KEY)) {
-        $meta_url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($file_id) . '?' . http_build_query([
-            'fields' => 'id,name,thumbnailLink',
-            'supportsAllDrives' => 'true',
-            'key' => STUDIO_GOOGLE_API_KEY
-        ], '', '&', PHP_QUERY_RFC3986);
+    $slice = array_slice($to_fetch, 0, $max_files);
+    $batches = array_chunk($slice, 6);
 
-        $resp = studio_remote_get($meta_url, ['timeout' => 8]);
-        if (!is_wp_error($resp) && wp_remote_retrieve_response_code($resp) === 200) {
-            $body = json_decode(wp_remote_retrieve_body($resp), true);
-            if (!empty($body['name'])) {
-                $tUrl = !empty($body['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $body['thumbnailLink']) : ($thumb_map[$file_id] ?? '');
-                $resolved = [
-                    'name' => $body['name'],
-                    'thumbnailLink' => $tUrl
+    foreach ($batches as $batch) {
+        if (class_exists('WpOrg\Requests\Requests') || class_exists('Requests')) {
+            $requests = [];
+            foreach ($batch as $idx => $item) {
+                $url = !empty($item['thumb_link'])
+                    ? ($item['thumb_link'] . '=s400')
+                    : ('https://lh3.googleusercontent.com/d/' . rawurlencode($item['id']) . '=w400');
+                $requests[$idx] = [
+                    'url' => $url,
+                    'headers' => [
+                        'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                        'Accept' => 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+                    ],
+                    'type' => 'GET'
                 ];
-                if ($fmeta_key) {
-                    $fmeta_map[$file_id] = $resolved;
-                    set_transient($fmeta_key, $fmeta_map, 7 * DAY_IN_SECONDS);
+            }
+            $options = ['timeout' => 5, 'connect_timeout' => 4];
+            $responses = class_exists('WpOrg\Requests\Requests')
+                ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
+                : \Requests::request_multiple($requests, $options);
+
+            foreach ($responses as $idx => $resp) {
+                if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
+                    if (studio_is_valid_image_bytes($resp->body) && strlen($resp->body) < 5 * 1024 * 1024) {
+                        $info = $batch[$idx]['info'];
+                        if (!file_exists($info['dir'])) {
+                            wp_mkdir_p($info['dir']);
+                        }
+                        @file_put_contents($info['path'], $resp->body);
+                        $cached++;
+                    }
                 }
-                if ($tmap_key && $tUrl) {
-                    $thumb_map[$file_id] = $tUrl;
-                    set_transient($tmap_key, $thumb_map, 7 * DAY_IN_SECONDS);
-                }
-                return $resolved;
             }
         }
     }
 
-    // Lapis 2: Ekstrak nama file asli dari header Content-Disposition milik CDN lh3.googleusercontent.com
-    $cdn_url = 'https://lh3.googleusercontent.com/d/' . rawurlencode($file_id) . '=w400';
-    $cdn_resp = studio_remote_get($cdn_url, ['timeout' => 8]);
-    if (!is_wp_error($cdn_resp) && wp_remote_retrieve_response_code($cdn_resp) === 200) {
-        $cd = (string) wp_remote_retrieve_header($cdn_resp, 'content-disposition');
-        $body = wp_remote_retrieve_body($cdn_resp);
-
-        // Sekaligus simpan gambar ke disk cache agar request thumbnail berikutnya instan
-        if (studio_is_valid_image_bytes($body) && strlen($body) < 5 * 1024 * 1024) {
-            $upload_dir = wp_upload_dir();
-            $cache_dir = $upload_dir['basedir'] . '/studio-cache';
-            if (!file_exists($cache_dir)) wp_mkdir_p($cache_dir);
-            $cache_file = $cache_dir . '/v2_' . md5($file_id . '_400') . '.jpg';
-            if (!file_exists($cache_file)) {
-                file_put_contents($cache_file, $body);
-            }
-        }
-
-        if (preg_match('/filename\*=UTF-8\'\'([^;]+)|filename="([^"]+)"/i', $cd, $m)) {
-            $extracted_name = !empty($m[2]) ? $m[2] : rawurldecode($m[1]);
-            if ($extracted_name) {
-                $resolved = [
-                    'name' => $extracted_name,
-                    'thumbnailLink' => $thumb_map[$file_id] ?? ''
-                ];
-                if ($fmeta_key) {
-                    $fmeta_map[$file_id] = $resolved;
-                    set_transient($fmeta_key, $fmeta_map, 7 * DAY_IN_SECONDS);
-                }
-                return $resolved;
-            }
-        }
+    $remaining = max(0, $total - $cached);
+    if ($remaining > 0 && count($to_fetch) > $max_files) {
+        studio_schedule_prefetch_thumbs($folder_id);
     }
 
     return [
-        'name' => $file_id,
-        'thumbnailLink' => $thumb_map[$file_id] ?? ''
+        'total' => $total,
+        'cached' => $cached,
+        'remaining' => $remaining
     ];
 }
-
-// Generate signed URL
-function studio_sign_url($file_id, $w, $folder_id = '') {
-    if (strpos($file_id, 'demo') === 0) return '';
-    $exp = time() + (12 * HOUR_IN_SECONDS);
-    $sig = hash_hmac('sha256', $file_id . '|' . $exp, wp_salt('auth'));
-    $args = [
-        'studio_thumb' => $file_id,
-        'w' => (int) $w,
-        'exp' => $exp,
-        'sig' => $sig
-    ];
-    if (!empty($folder_id)) {
-        $args['f'] = $folder_id;
-    }
-    return add_query_arg($args, home_url('/'));
-}
+add_action('studio_warm_thumbs_event', 'studio_prefetch_thumbs');
 
 // Helper sanitasi daftar ID pilihan klien
 function studio_sanitize_selected_ids($ids) {
@@ -1470,15 +1987,149 @@ function studio_sanitize_selected_ids($ids) {
     return array_values(array_unique($clean));
 }
 
+// Fase A: Callback Diagnostik Drive API (Khusus Admin)
+function studio_api_editor_diagnostics(WP_REST_Request $request) {
+    global $wpdb;
+    $key_defined = defined('STUDIO_GOOGLE_API_KEY') && !empty(STUDIO_GOOGLE_API_KEY);
+    $folder_id = sanitize_text_field((string) $request->get_param('folder_id'));
+    $sample_file_id = '';
+
+    if (!$folder_id) {
+        $latest = $wpdb->get_row("SELECT source_folder_id, selected_ids FROM {$wpdb->prefix}studio_galleries ORDER BY updated_at DESC LIMIT 1");
+        if ($latest) {
+            $folder_id = (string) $latest->source_folder_id;
+            $s_ids = studio_sanitize_selected_ids(json_decode((string) $latest->selected_ids, true) ?: []);
+            if (!empty($s_ids)) {
+                $sample_file_id = $s_ids[0];
+            }
+        }
+    }
+
+    $list_test = null;
+    if ($key_defined && $folder_id) {
+        $t0 = microtime(true);
+        $q = "'" . $folder_id . "' in parents and mimeType contains 'image/' and trashed=false";
+        $url = 'https://www.googleapis.com/drive/v3/files?' . http_build_query([
+            'q' => $q,
+            'pageSize' => 10,
+            'fields' => 'nextPageToken,files(id,name,mimeType)',
+            'supportsAllDrives' => 'true',
+            'includeItemsFromAllDrives' => 'true',
+            'key' => STUDIO_GOOGLE_API_KEY
+        ], '', '&', PHP_QUERY_RFC3986);
+        $resp = studio_remote_get($url, ['timeout' => 10]);
+        $dur_ms = (int) round((microtime(true) - $t0) * 1000);
+
+        if (is_wp_error($resp)) {
+            $list_test = [
+                'httpStatus' => 0,
+                'errorStatus' => 'WP_ERROR',
+                'errorReason' => $resp->get_error_code(),
+                'errorMessage' => $resp->get_error_message(),
+                'durationMs' => $dur_ms,
+                'fileCount' => 0
+            ];
+        } else {
+            $code = wp_remote_retrieve_response_code($resp);
+            $body = json_decode(wp_remote_retrieve_body($resp), true);
+            $files = $body['files'] ?? [];
+            if (!$sample_file_id && !empty($files[0]['id'])) {
+                $sample_file_id = $files[0]['id'];
+            }
+            $list_test = [
+                'httpStatus' => $code,
+                'errorStatus' => $body['error']['status'] ?? null,
+                'errorReason' => $body['error']['errors'][0]['reason'] ?? null,
+                'errorMessage' => $body['error']['message'] ?? null,
+                'durationMs' => $dur_ms,
+                'fileCount' => count($files),
+                'hasMorePages' => !empty($body['nextPageToken'])
+            ];
+        }
+    }
+
+    $get_test = null;
+    if ($key_defined && $sample_file_id && strpos($sample_file_id, 'demo') !== 0) {
+        $t0 = microtime(true);
+        $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($sample_file_id) . '?' . http_build_query([
+            'fields' => 'id,name,mimeType,capabilities(canDownload)',
+            'supportsAllDrives' => 'true',
+            'key' => STUDIO_GOOGLE_API_KEY
+        ], '', '&', PHP_QUERY_RFC3986);
+        $resp = studio_remote_get($url, ['timeout' => 8]);
+        $dur_ms = (int) round((microtime(true) - $t0) * 1000);
+
+        if (is_wp_error($resp)) {
+            $get_test = [
+                'fileId' => $sample_file_id,
+                'httpStatus' => 0,
+                'errorReason' => $resp->get_error_code(),
+                'errorMessage' => $resp->get_error_message(),
+                'durationMs' => $dur_ms
+            ];
+        } else {
+            $code = wp_remote_retrieve_response_code($resp);
+            $body = json_decode(wp_remote_retrieve_body($resp), true);
+            $get_test = [
+                'fileId' => $sample_file_id,
+                'httpStatus' => $code,
+                'name' => $body['name'] ?? null,
+                'mimeType' => $body['mimeType'] ?? null,
+                'capabilities' => $body['capabilities'] ?? null,
+                'errorReason' => $body['error']['errors'][0]['reason'] ?? null,
+                'errorMessage' => $body['error']['message'] ?? null,
+                'durationMs' => $dur_ms
+            ];
+        }
+    }
+
+    $upload_dir = wp_upload_dir();
+    $cache_dir = $upload_dir['basedir'] . '/studio-cache';
+    $cache_bytes = 0;
+    $cache_files = 0;
+    if (is_dir($cache_dir)) {
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($cache_dir, FilesystemIterator::SKIP_DOTS));
+        foreach ($it as $fi) {
+            if ($fi->isFile() && substr($fi->getFilename(), -4) === '.jpg') {
+                $cache_bytes += $fi->getSize();
+                $cache_files++;
+            }
+        }
+    }
+
+    $curl_ver = function_exists('curl_version') ? (curl_version()['version'] ?? 'unknown') : 'none';
+
+    return rest_ensure_response([
+        'keyDefined' => $key_defined,
+        'testedFolderId' => $folder_id,
+        'filesListTest' => $list_test,
+        'filesGetTest' => $get_test,
+        'environment' => [
+            'phpVersion' => PHP_VERSION,
+            'dbVersion' => get_option('studio_db_version', 'none'),
+            'wpDebug' => defined('WP_DEBUG') && WP_DEBUG,
+            'wpDebugLog' => defined('WP_DEBUG_LOG') && WP_DEBUG_LOG,
+            'extObjectCache' => function_exists('wp_using_ext_object_cache') && wp_using_ext_object_cache(),
+            'curlVersion' => $curl_ver,
+            'cacheFileCount' => $cache_files,
+            'cacheSizeMb' => round($cache_bytes / (1024 * 1024), 2)
+        ]
+    ]);
+}
+
 // API Callbacks
 function studio_api_editor_get_galleries() {
     global $wpdb;
-    $galleries = $wpdb->get_results("SELECT id, title, token, source_folder_id, result_folder_id, max_select, status, selected_ids, updated_at FROM {$wpdb->prefix}studio_galleries ORDER BY updated_at DESC");
+    $galleries = $wpdb->get_results(
+        "SELECT id, title, token, source_folder_id, result_folder_id, max_select, status, selected_count, updated_at
+         FROM {$wpdb->prefix}studio_galleries
+         ORDER BY updated_at DESC"
+    );
 
+    $base_client_url = studio_build_page_url('template-studio-client.php');
     foreach ($galleries as &$g) {
-        $ids = json_decode($g->selected_ids, true) ?: [];
-        $g->selected_count = count($ids);
-        $g->link = studio_build_page_url('template-studio-client.php', ['k' => $g->token]);
+        $g->selected_count = (int) $g->selected_count;
+        $g->link = $base_client_url ? add_query_arg(['k' => $g->token], $base_client_url) : '';
     }
     return rest_ensure_response($galleries);
 }
@@ -1503,9 +2154,112 @@ function studio_api_editor_create_gallery(WP_REST_Request $request) {
         'max_select' => max(0, (int) $request->get_param('max_select')),
         'result_folder_id' => $result_folder_id,
         'selected_ids' => '[]',
+        'selected_meta' => '{}',
+        'selected_count' => 0,
         'status' => 'unstarted'
     ]);
-    return rest_ensure_response(['ok' => true, 'id' => $wpdb->insert_id]);
+    $new_id = $wpdb->insert_id;
+
+    // Pastikan indeks file & warm-up thumbnail terjadwal
+    studio_get_file_index($folder_id);
+    studio_schedule_prefetch_thumbs($folder_id);
+    if ($result_folder_id !== '') {
+        studio_get_file_index($result_folder_id);
+        studio_schedule_prefetch_thumbs($result_folder_id);
+    }
+
+    return rest_ensure_response(['ok' => true, 'id' => $new_id]);
+}
+
+function studio_build_editor_gallery_detail($g, $force_refresh = false) {
+    global $wpdb;
+    $selected_ids = studio_sanitize_selected_ids(json_decode((string) $g->selected_ids, true) ?: []);
+
+    if ($force_refresh) {
+        $meta = studio_backfill_gallery_row($g, true);
+    } elseif ($g->selected_meta === null && !empty($selected_ids)) {
+        $meta = studio_backfill_gallery_row($g, false);
+    } else {
+        $meta = json_decode((string) ($g->selected_meta ?: '{}'), true) ?: [];
+    }
+
+    // Ambil urutan dan cadangan nama dari tabel lokal studio_files (0 panggilan ke Google Drive)
+    $db_files = [];
+    if (!empty($selected_ids) && !empty($g->source_folder_id)) {
+        $placeholders = implode(',', array_fill(0, count($selected_ids), '%s'));
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT file_id, name, thumb_link, position
+             FROM {$wpdb->prefix}studio_files
+             WHERE folder_id = %s AND file_id IN ($placeholders)",
+            array_merge([$g->source_folder_id], $selected_ids)
+        ));
+        foreach ((array) $rows as $r) {
+            $db_files[$r->file_id] = $r;
+        }
+    }
+
+    $selected_photos = [];
+    $missing_count = 0;
+    $meta_updated = false;
+
+    foreach ($selected_ids as $sid) {
+        $is_demo = strpos($sid, 'demo') === 0;
+        if ($is_demo && preg_match('/^demo(\d+)/', $sid, $m)) {
+            $demo = studio_make_demo_photo((int) $m[1], $g->source_folder_id);
+            $selected_photos[] = [
+                'id' => $sid,
+                'name' => $demo['name'],
+                'nameMissing' => false,
+                'src' => $demo['thumbnailLink'],
+                'srcLg' => $demo['thumbnailLink'],
+                'fallbackSrc' => $demo['thumbnailLink'],
+                'fallbackSrcLg' => $demo['thumbnailLink']
+            ];
+            continue;
+        }
+
+        $name = isset($meta[$sid]) && $meta[$sid] !== '' && $meta[$sid] !== $sid ? (string) $meta[$sid] : null;
+        if ($name === null && isset($db_files[$sid]) && $db_files[$sid]->name !== '' && $db_files[$sid]->name !== $sid) {
+            $name = (string) $db_files[$sid]->name;
+            $meta[$sid] = $name;
+            $meta_updated = true;
+        }
+
+        $name_missing = ($name === null);
+        if ($name_missing) {
+            $missing_count++;
+        }
+
+        $selected_photos[] = [
+            'id' => $sid,
+            'name' => $name,
+            'nameMissing' => $name_missing,
+            'src' => studio_get_thumb_url($sid, 400, $g->source_folder_id),
+            'srcLg' => studio_get_thumb_url($sid, 1600, $g->source_folder_id),
+            'fallbackSrc' => 'https://lh3.googleusercontent.com/d/' . rawurlencode($sid) . '=w400',
+            'fallbackSrcLg' => 'https://lh3.googleusercontent.com/d/' . rawurlencode($sid) . '=w1600'
+        ];
+    }
+
+    if ($meta_updated) {
+        $wpdb->update($wpdb->prefix . 'studio_galleries', [
+            'selected_meta' => wp_json_encode($meta, JSON_UNESCAPED_UNICODE),
+            'selected_count' => count($selected_ids)
+        ], ['id' => $g->id]);
+    }
+
+    $sync_info = get_option('studio_sync_' . md5($g->source_folder_id));
+    $synced_at = is_array($sync_info) && !empty($sync_info['synced_at']) ? $sync_info['synced_at'] : null;
+
+    return [
+        'id' => (int) $g->id,
+        'title' => $g->title,
+        'status' => $g->status,
+        'note' => $g->note,
+        'syncedAt' => $synced_at,
+        'missingNameCount' => $missing_count,
+        'photos' => $selected_photos
+    ];
 }
 
 function studio_api_editor_get_gallery(WP_REST_Request $request) {
@@ -1515,68 +2269,49 @@ function studio_api_editor_get_gallery(WP_REST_Request $request) {
     if (!$g) return new WP_Error('not_found', 'Galeri tidak ditemukan', ['status' => 404]);
 
     $force_refresh = (bool) $request->get_param('refresh');
-    $photos = studio_get_drive_photos($g->source_folder_id, $force_refresh);
+    return rest_ensure_response(studio_build_editor_gallery_detail($g, $force_refresh));
+}
 
-    $selected_ids = studio_sanitize_selected_ids(json_decode($g->selected_ids, true) ?: []);
-    $selected_photos = [];
-    $found_map = [];
+function studio_api_editor_resync_gallery(WP_REST_Request $request) {
+    global $wpdb;
+    $id = (int) $request->get_param('id');
+    $g = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
+    if (!$g) return new WP_Error('not_found', 'Galeri tidak ditemukan', ['status' => 404]);
 
-    // Pertahankan urutan berdasarkan urutan foto di folder jika ditemukan
-    foreach ($photos as $p) {
-        if (in_array($p['id'], $selected_ids, true)) {
-            $found_map[$p['id']] = true;
-            $is_demo = strpos($p['id'], 'demo') === 0;
-            $src = $is_demo
-                ? $p['thumbnailLink']
-                : studio_sign_url($p['id'], 400, $g->source_folder_id);
-            $selected_photos[] = [
-                'id' => $p['id'],
-                'name' => $p['name'],
-                'src' => $src,
-                'fallbackSrc' => $is_demo ? $src : ('https://lh3.googleusercontent.com/d/' . rawurlencode($p['id']) . '=w400')
-            ];
-        }
+    return rest_ensure_response(studio_build_editor_gallery_detail($g, true));
+}
+
+function studio_api_editor_warm_thumbs(WP_REST_Request $request) {
+    global $wpdb;
+    $id = (int) $request->get_param('id');
+    $g = $wpdb->get_row($wpdb->prepare("SELECT source_folder_id FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
+    if (!$g) return new WP_Error('not_found', 'Galeri tidak ditemukan', ['status' => 404]);
+
+    studio_get_file_index($g->source_folder_id);
+    $stats = studio_prefetch_thumbs($g->source_folder_id, 48);
+    return rest_ensure_response(array_merge(['ok' => true], $stats));
+}
+
+function studio_cleanup_unused_folder_files($folder_id, $exclude_gallery_id = 0) {
+    global $wpdb;
+    if (empty($folder_id)) return;
+    $in_use = (int) $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM {$wpdb->prefix}studio_galleries
+         WHERE id != %d AND (source_folder_id = %s OR result_folder_id = %s)",
+        (int) $exclude_gallery_id,
+        $folder_id,
+        $folder_id
+    ));
+    if ($in_use === 0) {
+        $wpdb->delete($wpdb->prefix . 'studio_files', ['folder_id' => $folder_id]);
+        delete_option('studio_sync_' . md5($folder_id));
     }
-
-    // Fallback: jika ada ID terpilih di DB yang belum ditemukan di listing folder,
-    // resolve nama file aslinya dari cache metadata / Drive API / header Content-Disposition
-    foreach ($selected_ids as $sid) {
-        if (isset($found_map[$sid])) continue;
-
-        if (strpos($sid, 'demo') === 0) {
-            if (preg_match('/^demo(\d+)/', $sid, $m)) {
-                $demo = studio_make_demo_photo((int) $m[1], $g->source_folder_id);
-                $selected_photos[] = [
-                    'id' => $sid,
-                    'name' => $demo['name'],
-                    'src' => $demo['thumbnailLink'],
-                    'fallbackSrc' => $demo['thumbnailLink']
-                ];
-            }
-        } else {
-            $resolved = studio_resolve_single_file_meta($sid, $g->source_folder_id);
-            $selected_photos[] = [
-                'id' => $sid,
-                'name' => $resolved['name'] ?? $sid,
-                'src' => studio_sign_url($sid, 400, $g->source_folder_id),
-                'fallbackSrc' => 'https://lh3.googleusercontent.com/d/' . rawurlencode($sid) . '=w400'
-            ];
-        }
-    }
-
-    return rest_ensure_response([
-        'id' => $g->id,
-        'title' => $g->title,
-        'status' => $g->status,
-        'note' => $g->note,
-        'photos' => $selected_photos
-    ]);
 }
 
 function studio_api_editor_update_gallery(WP_REST_Request $request) {
     global $wpdb;
     $id = (int) $request->get_param('id');
-    $g = $wpdb->get_row($wpdb->prepare("SELECT source_folder_id FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
+    $g = $wpdb->get_row($wpdb->prepare("SELECT source_folder_id, result_folder_id FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
     if (!$g) return new WP_Error('not_found', 'Galeri tidak ditemukan', ['status' => 404]);
 
     $data = [];
@@ -1595,22 +2330,27 @@ function studio_api_editor_update_gallery(WP_REST_Request $request) {
         }
     }
 
+    $old_source_folder = $g->source_folder_id;
     if ($request->has_param('source_folder_id')) {
         $new_folder = sanitize_text_field($request->get_param('source_folder_id'));
         if (preg_match('/^[A-Za-z0-9_-]{10,}$/', $new_folder)) {
             $data['source_folder_id'] = $new_folder;
-            if ($new_folder !== $g->source_folder_id) {
+            if ($new_folder !== $old_source_folder) {
                 $data['selected_ids'] = '[]';
+                $data['selected_meta'] = '{}';
+                $data['selected_count'] = 0;
                 $data['status'] = 'draft';
-                delete_transient('studio_drive_v3_' . md5($g->source_folder_id));
-                delete_transient('studio_fmeta_' . md5($g->source_folder_id));
-                delete_transient('studio_tmap_' . md5($g->source_folder_id));
             }
         }
     }
 
     if (!empty($data)) {
         $wpdb->update($wpdb->prefix . 'studio_galleries', $data, ['id' => $id]);
+        if (isset($data['source_folder_id']) && $data['source_folder_id'] !== $old_source_folder) {
+            studio_cleanup_unused_folder_files($old_source_folder, $id);
+            studio_get_file_index($data['source_folder_id']);
+            studio_schedule_prefetch_thumbs($data['source_folder_id']);
+        }
     }
     return rest_ensure_response(['ok' => true]);
 }
@@ -1619,25 +2359,27 @@ function studio_api_editor_delete_gallery(WP_REST_Request $request) {
     global $wpdb;
     $id = (int) $request->get_param('id');
     $g = $wpdb->get_row($wpdb->prepare("SELECT source_folder_id, result_folder_id FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
+    $wpdb->delete($wpdb->prefix . 'studio_galleries', ['id' => $id]);
+
     if ($g) {
         if ($g->source_folder_id) {
-            delete_transient('studio_drive_v3_' . md5($g->source_folder_id));
-            delete_transient('studio_fmeta_' . md5($g->source_folder_id));
-            delete_transient('studio_tmap_' . md5($g->source_folder_id));
+            studio_cleanup_unused_folder_files($g->source_folder_id, $id);
         }
         if ($g->result_folder_id) {
-            delete_transient('studio_drive_v3_' . md5($g->result_folder_id));
-            delete_transient('studio_fmeta_' . md5($g->result_folder_id));
-            delete_transient('studio_tmap_' . md5($g->result_folder_id));
+            studio_cleanup_unused_folder_files($g->result_folder_id, $id);
         }
     }
-    $wpdb->delete($wpdb->prefix . 'studio_galleries', ['id' => $id]);
     return rest_ensure_response(['ok' => true]);
 }
 
 function studio_api_editor_reopen_gallery(WP_REST_Request $request) {
     global $wpdb;
     $id = (int) $request->get_param('id');
+    $g = $wpdb->get_row($wpdb->prepare("SELECT status FROM {$wpdb->prefix}studio_galleries WHERE id = %d", $id));
+    if (!$g) return new WP_Error('not_found', 'Galeri tidak ditemukan', ['status' => 404]);
+    if ($g->status !== 'submitted') {
+        return new WP_Error('invalid_status', 'Hanya galeri berstatus Terkirim yang dapat dibuka kembali.', ['status' => 409]);
+    }
     $wpdb->update($wpdb->prefix . 'studio_galleries', ['status' => 'reopened', 'reopened_at' => current_time('mysql')], ['id' => $id]);
     return rest_ensure_response(['ok' => true]);
 }
@@ -1661,11 +2403,11 @@ function studio_api_editor_drive_resolve(WP_REST_Request $request) {
 
     // Jika STUDIO_GOOGLE_API_KEY belum diset, dukung Mode Demo agar alur buat/edit galeri tetap jalan
     if (!defined('STUDIO_GOOGLE_API_KEY') || empty(STUDIO_GOOGLE_API_KEY)) {
-        $photos = studio_get_drive_photos($folder_id);
+        $index = studio_sync_folder($folder_id);
         return rest_ensure_response([
             'folderId' => $folder_id,
             'name' => 'Mode Demo (' . substr($folder_id, 0, 8) . '...)',
-            'photoCount' => count($photos),
+            'photoCount' => is_array($index) ? count($index) : 24,
             'isDemo' => true
         ]);
     }
@@ -1684,17 +2426,20 @@ function studio_api_editor_drive_resolve(WP_REST_Request $request) {
         return new WP_Error('not_folder', 'ID tersebut bukan sebuah folder Google Drive', ['status' => 400]);
     }
 
-    $photos = studio_get_drive_photos($folder_id, true);
+    $index = studio_sync_folder($folder_id);
+    if (is_wp_error($index)) {
+        return $index;
+    }
     return rest_ensure_response([
         'folderId' => $folder_id,
         'name' => $body['name'] ?? $folder_id,
-        'photoCount' => count($photos)
+        'photoCount' => count($index)
     ]);
 }
 
 function studio_api_client_get_gallery(WP_REST_Request $request) {
     $g = $request->get_param('gallery');
-    $ids = studio_sanitize_selected_ids(json_decode($g->selected_ids, true) ?: []);
+    $ids = studio_sanitize_selected_ids(json_decode((string) $g->selected_ids, true) ?: []);
     return rest_ensure_response([
         'title' => $g->title,
         'maxSelect' => (int) $g->max_select,
@@ -1707,38 +2452,123 @@ function studio_api_client_get_gallery(WP_REST_Request $request) {
     ]);
 }
 
+function studio_format_client_photo_item($p, $folder_id) {
+    $fid = $p['id'];
+    $is_demo = strpos($fid, 'demo') === 0;
+    return [
+        'id' => $fid,
+        'name' => $p['name'],
+        'src' => $is_demo ? $p['thumb_link'] : studio_get_thumb_url($fid, 400, $folder_id),
+        'srcLg' => $is_demo ? $p['thumb_link'] : studio_get_thumb_url($fid, 1600, $folder_id),
+        'fallbackSrc' => $is_demo ? $p['thumb_link'] : ('https://lh3.googleusercontent.com/d/' . rawurlencode($fid) . '=w400'),
+        'fallbackSrcLg' => $is_demo ? $p['thumb_link'] : ('https://lh3.googleusercontent.com/d/' . rawurlencode($fid) . '=w1600')
+    ];
+}
+
 function studio_api_client_get_photos(WP_REST_Request $request) {
     $g = $request->get_param('gallery');
-    $photos = studio_get_drive_photos($g->source_folder_id);
-    foreach ($photos as &$p) {
-        $is_demo = strpos($p['id'], 'demo') === 0;
-        $p['src'] = $is_demo
-            ? $p['thumbnailLink']
-            : studio_sign_url($p['id'], 400, $g->source_folder_id);
-        $p['fallbackSrc'] = $is_demo
-            ? $p['thumbnailLink']
-            : ('https://lh3.googleusercontent.com/d/' . rawurlencode($p['id']) . '=w400');
-        unset($p['thumbnailLink']);
+    $is_stale = false;
+    $index = studio_get_file_index($g->source_folder_id, false, $is_stale);
+
+    if ($index === null) {
+        return new WP_Error('drive_unavailable', 'Daftar foto belum bisa dimuat dari Google Drive. Silakan coba lagi sebentar.', ['status' => 503]);
     }
-    return rest_ensure_response($photos);
+
+    $sync_meta = get_option('studio_sync_' . md5($g->source_folder_id));
+    $synced_at = is_array($sync_meta) && !empty($sync_meta['synced_at']) ? $sync_meta['synced_at'] : '';
+    $etag = 'W/"st-p-' . md5($g->source_folder_id . '|' . count($index) . '|' . $synced_at) . '"';
+
+    if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim((string) $_SERVER['HTTP_IF_NONE_MATCH']) === $etag) {
+        return new WP_REST_Response(null, 304, ['ETag' => $etag]);
+    }
+
+    $photos = [];
+    foreach ($index as $p) {
+        $photos[] = studio_format_client_photo_item($p, $g->source_folder_id);
+    }
+
+    $resp = new WP_REST_Response($photos, 200);
+    $resp->header('ETag', $etag);
+    if ($is_stale) {
+        $resp->header('X-Studio-Stale', '1');
+    }
+    return $resp;
 }
 
 function studio_api_client_get_result(WP_REST_Request $request) {
     $g = $request->get_param('gallery');
     if (empty($g->result_folder_id)) return new WP_Error('no_result', 'Folder hasil edit belum tersedia', ['status' => 404]);
 
-    $photos = studio_get_drive_photos($g->result_folder_id);
-    foreach ($photos as &$p) {
-        $is_demo = strpos($p['id'], 'demo') === 0;
-        $p['src'] = $is_demo
-            ? $p['thumbnailLink']
-            : studio_sign_url($p['id'], 400, $g->result_folder_id);
-        $p['fallbackSrc'] = $is_demo
-            ? $p['thumbnailLink']
-            : ('https://lh3.googleusercontent.com/d/' . rawurlencode($p['id']) . '=w400');
-        unset($p['thumbnailLink']);
+    $is_stale = false;
+    $index = studio_get_file_index($g->result_folder_id, false, $is_stale);
+    if ($index === null) {
+        return new WP_Error('drive_unavailable', 'Daftar foto hasil edit belum bisa dimuat. Silakan coba lagi sebentar.', ['status' => 503]);
     }
-    return rest_ensure_response(['folderId' => $g->result_folder_id, 'files' => $photos]);
+
+    $sync_meta = get_option('studio_sync_' . md5($g->result_folder_id));
+    $synced_at = is_array($sync_meta) && !empty($sync_meta['synced_at']) ? $sync_meta['synced_at'] : '';
+    $etag = 'W/"st-r-' . md5($g->result_folder_id . '|' . count($index) . '|' . $synced_at) . '"';
+
+    if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim((string) $_SERVER['HTTP_IF_NONE_MATCH']) === $etag) {
+        return new WP_REST_Response(null, 304, ['ETag' => $etag]);
+    }
+
+    $photos = [];
+    foreach ($index as $p) {
+        $photos[] = studio_format_client_photo_item($p, $g->result_folder_id);
+    }
+
+    $resp = new WP_REST_Response(['folderId' => $g->result_folder_id, 'files' => $photos], 200);
+    $resp->header('ETag', $etag);
+    return $resp;
+}
+
+// B5 & C6: Validasi ringan via SQL IN (...) & snapshot nama ke selected_meta
+function studio_validate_and_snapshot_selection($g, array $raw_ids) {
+    global $wpdb;
+    $ids = studio_sanitize_selected_ids($raw_ids);
+    if ($g->max_select > 0 && count($ids) > $g->max_select) {
+        return new WP_Error('limit', "Maksimal pilihan adalah {$g->max_select} foto.", ['status' => 422]);
+    }
+
+    $table_files = $wpdb->prefix . 'studio_files';
+    $has_folder_rows = (int) $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM {$table_files} WHERE folder_id = %s",
+        $g->source_folder_id
+    ));
+
+    if ($has_folder_rows === 0) {
+        $index = studio_get_file_index($g->source_folder_id);
+        if ($index === null) {
+            return new WP_Error('drive_unavailable', 'Daftar foto belum bisa dimuat. Coba lagi sebentar.', ['status' => 503]);
+        }
+    }
+
+    $old_meta = json_decode((string) ($g->selected_meta ?: '{}'), true) ?: [];
+    $valid_ids = [];
+    $meta = [];
+
+    if (!empty($ids)) {
+        $placeholders = implode(',', array_fill(0, count($ids), '%s'));
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT file_id, name FROM {$table_files} WHERE folder_id = %s AND file_id IN ($placeholders)",
+            array_merge([$g->source_folder_id], $ids)
+        ), OBJECT_K);
+
+        foreach ($ids as $id) {
+            if (isset($rows[$id])) {
+                $valid_ids[] = $id;
+                $db_name = (string) $rows[$id]->name;
+                $meta[$id] = ($db_name !== '' && $db_name !== $id) ? $db_name : ($old_meta[$id] ?? '');
+            }
+        }
+    }
+
+    return [
+        'ids' => $valid_ids,
+        'meta' => $meta,
+        'count' => count($valid_ids)
+    ];
 }
 
 function studio_api_client_update_selection(WP_REST_Request $request) {
@@ -1746,32 +2576,32 @@ function studio_api_client_update_selection(WP_REST_Request $request) {
     $g = $request->get_param('gallery');
     if ($g->status === 'submitted') return new WP_Error('locked', 'Pilihan sudah dikunci', ['status' => 409]);
 
-    $ids = studio_sanitize_selected_ids($request->get_param('ids') ?: []);
-    if ($g->max_select > 0 && count($ids) > $g->max_select) {
-        return new WP_Error('limit', "Maksimal pilihan adalah {$g->max_select} foto.", ['status' => 422]);
-    }
-
-    // Validasi ID terhadap daftar foto folder sumber jika daftar tersedia
-    $folder_photos = studio_get_drive_photos($g->source_folder_id);
-    if (!empty($folder_photos)) {
-        $allowed_map = [];
-        foreach ($folder_photos as $fp) {
-            $allowed_map[$fp['id']] = true;
-        }
-        $ids = array_values(array_filter($ids, function($id) use ($allowed_map) {
-            return isset($allowed_map[$id]);
-        }));
-    }
-
-    $note = $request->has_param('note') ? sanitize_textarea_field($request->get_param('note')) : $g->note;
+    $has_ids = $request->has_param('ids');
+    $has_note = $request->has_param('note');
     $new_status = ($g->status === 'reopened') ? 'reopened' : 'draft';
-    $wpdb->update($wpdb->prefix . 'studio_galleries', [
-        'selected_ids' => wp_json_encode($ids),
-        'note' => mb_substr((string) $note, 0, 5000),
-        'status' => $new_status
-    ], ['id' => $g->id]);
 
-    return rest_ensure_response(['ok' => true, 'selectedIds' => $ids, 'status' => $new_status]);
+    $update_data = ['status' => $new_status];
+    $final_ids = studio_sanitize_selected_ids(json_decode((string) $g->selected_ids, true) ?: []);
+
+    if ($has_ids) {
+        $validated = studio_validate_and_snapshot_selection($g, (array) ($request->get_param('ids') ?: []));
+        if (is_wp_error($validated)) {
+            return $validated;
+        }
+        $final_ids = $validated['ids'];
+        $update_data['selected_ids'] = wp_json_encode($final_ids);
+        $update_data['selected_meta'] = wp_json_encode($validated['meta'], JSON_UNESCAPED_UNICODE);
+        $update_data['selected_count'] = $validated['count'];
+    }
+
+    if ($has_note) {
+        $note = sanitize_textarea_field((string) $request->get_param('note'));
+        $update_data['note'] = mb_substr($note, 0, 5000);
+    }
+
+    $wpdb->update($wpdb->prefix . 'studio_galleries', $update_data, ['id' => $g->id]);
+
+    return rest_ensure_response(['ok' => true, 'selectedIds' => $final_ids, 'status' => $new_status]);
 }
 
 function studio_api_client_submit(WP_REST_Request $request) {
@@ -1779,83 +2609,127 @@ function studio_api_client_submit(WP_REST_Request $request) {
     $g = $request->get_param('gallery');
     if ($g->status === 'submitted') return new WP_Error('locked', 'Pilihan sudah dikunci', ['status' => 409]);
 
-    $raw_ids = $request->has_param('ids') ? $request->get_param('ids') : (json_decode($g->selected_ids, true) ?: []);
-    $ids = studio_sanitize_selected_ids($raw_ids);
-    if (empty($ids)) {
+    $raw_ids = $request->has_param('ids') ? (array) $request->get_param('ids') : (json_decode((string) $g->selected_ids, true) ?: []);
+    $validated = studio_validate_and_snapshot_selection($g, $raw_ids);
+    if (is_wp_error($validated)) {
+        return $validated;
+    }
+
+    if (empty($validated['ids'])) {
         return new WP_Error('empty_selection', 'Pilih minimal 1 foto sebelum mengirim.', ['status' => 422]);
     }
-    if ($g->max_select > 0 && count($ids) > $g->max_select) {
-        return new WP_Error('limit', "Maksimal pilihan adalah {$g->max_select} foto.", ['status' => 422]);
-    }
 
-    // Validasi ID terhadap daftar foto folder sumber jika daftar tersedia
-    $folder_photos = studio_get_drive_photos($g->source_folder_id);
-    if (!empty($folder_photos)) {
-        $allowed_map = [];
-        foreach ($folder_photos as $fp) {
-            $allowed_map[$fp['id']] = true;
-        }
-        $ids = array_values(array_filter($ids, function($id) use ($allowed_map) {
-            return isset($allowed_map[$id]);
-        }));
-    }
-
-    $note = $request->has_param('note') ? sanitize_textarea_field($request->get_param('note')) : $g->note;
+    $note = $request->has_param('note') ? sanitize_textarea_field((string) $request->get_param('note')) : $g->note;
     $submitted_at = current_time('mysql');
     $wpdb->update($wpdb->prefix . 'studio_galleries', [
-        'selected_ids' => wp_json_encode($ids),
+        'selected_ids' => wp_json_encode($validated['ids']),
+        'selected_meta' => wp_json_encode($validated['meta'], JSON_UNESCAPED_UNICODE),
+        'selected_count' => $validated['count'],
         'note' => mb_substr((string) $note, 0, 5000),
         'status' => 'submitted',
         'submitted_at' => $submitted_at
     ], ['id' => $g->id]);
 
-    return rest_ensure_response(['ok' => true, 'submittedAt' => $submitted_at, 'selectedIds' => $ids]);
+    return rest_ensure_response(['ok' => true, 'submittedAt' => $submitted_at, 'selectedIds' => $validated['ids']]);
 }
 
-// 5.5 Proxy thumbnail dengan Multi-Tier Cepat & Direct CDN Redirect Fallback
+// 5.5 Proxy thumbnail dengan Cache Statis Sharded, Negative-Cache, Lock, ETag, & Multi-Tier Cepat (C1, C2, C5)
 add_action('init', function() {
     if (!isset($_GET['studio_thumb'])) return;
 
     $id = sanitize_text_field($_GET['studio_thumb']);
-    $folder_id = isset($_GET['f']) ? sanitize_text_field($_GET['f']) : '';
-    $w = (int) ($_GET['w'] ?? 400);
+    $raw_w = isset($_GET['w']) ? (int) $_GET['w'] : 400;
     $exp = (int) ($_GET['exp'] ?? 0);
-    $sig = $_GET['sig'] ?? '';
-
-    if ($w < 100) $w = 100;
-    if ($w > 2000) $w = 2000;
+    $sig = (string) ($_GET['sig'] ?? '');
 
     if (!preg_match('/^[A-Za-z0-9_-]{5,}$/', $id)) {
         wp_die('Invalid file ID', 'Error', ['response' => 400]);
     }
 
-    if (time() > $exp || !hash_equals(hash_hmac('sha256', $id . '|' . $exp, wp_salt('auth')), $sig)) {
+    // C1: Tolak lebar yang tidak ada di daftar putih
+    if (!in_array($raw_w, studio_allowed_widths(), true)) {
+        wp_die('Invalid width', 'Error', ['response' => 400]);
+    }
+    $w = $raw_w;
+
+    $expected_sig = hash_hmac('sha256', "$id|$w|$exp", wp_salt('auth'));
+    $legacy_sig = hash_hmac('sha256', "$id|$exp", wp_salt('auth'));
+    if (time() > $exp || (!hash_equals($expected_sig, $sig) && !hash_equals($legacy_sig, $sig))) {
         wp_die('Invalid or expired signature', 'Error', ['response' => 403]);
     }
 
+    $info = studio_thumb_cache_info($id, $w);
+    $etag = '"' . $info['hash'] . '"';
+
+    if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim((string) $_SERVER['HTTP_IF_NONE_MATCH']) === $etag && file_exists($info['path'])) {
+        @touch($info['path']);
+        while (ob_get_level()) ob_end_clean();
+        status_header(304);
+        header('ETag: ' . $etag);
+        header('Cache-Control: public, max-age=2592000, immutable');
+        exit;
+    }
+
     $upload_dir = wp_upload_dir();
-    $cache_dir = $upload_dir['basedir'] . '/studio-cache';
-    if (!file_exists($cache_dir)) wp_mkdir_p($cache_dir);
+    $legacy_v2 = $upload_dir['basedir'] . '/studio-cache/v2_' . md5($id . '_' . $w) . '.jpg';
 
-    $cache_file = $cache_dir . '/v2_' . md5($id . '_' . $w) . '.jpg';
-    $legacy_cache_file = $cache_dir . '/' . md5($id . $w) . '.jpg';
-
-    foreach ([$cache_file, $legacy_cache_file] as $cf) {
+    foreach ([$info['path'], $legacy_v2] as $cf) {
         if (file_exists($cf) && filesize($cf) > 100) {
             $head_bytes = file_get_contents($cf, false, null, 0, 16);
             if (studio_is_valid_image_bytes($head_bytes . str_repeat("\0", 100))) {
+                if ($cf === $legacy_v2 && !file_exists($info['path'])) {
+                    if (!file_exists($info['dir'])) wp_mkdir_p($info['dir']);
+                    @rename($legacy_v2, $info['path']);
+                    $cf = file_exists($info['path']) ? $info['path'] : $legacy_v2;
+                }
+                @touch($cf);
                 while (ob_get_level()) ob_end_clean();
                 header('Content-Type: image/jpeg');
-                header('Cache-Control: public, max-age=86400');
+                header('ETag: ' . $etag);
+                header('Cache-Control: public, max-age=2592000, immutable');
                 readfile($cf);
                 exit;
             }
         }
     }
 
-    $try_fetch_image = function($target_url) use ($id, $folder_id) {
+    $cdn_redirect_url = 'https://lh3.googleusercontent.com/d/' . rawurlencode($id) . '=w' . $w;
+    $fail_key = 'studio_thumbfail_' . $info['hash'];
+
+    // C5: Negative-cache 2 menit — langsung redirect 302 tanpa mengulang rantai
+    if (get_transient($fail_key)) {
+        while (ob_get_level()) ob_end_clean();
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Location: ' . $cdn_redirect_url, true, 302);
+        exit;
+    }
+
+    // C5: Lock per file (15 dtk) agar request paralel untuk gambar yang sama tidak menyerbu Google
+    $lock_key = 'studio_tlock_' . $info['hash'];
+    $lock_time = (int) get_option($lock_key, 0);
+    if ($lock_time && (time() - $lock_time) < 15) {
+        // Tunggu sebentar jika worker lain sedang mengunduh
+        for ($i = 0; $i < 4; $i++) {
+            usleep(250000);
+            if (file_exists($info['path']) && filesize($info['path']) > 100) {
+                while (ob_get_level()) ob_end_clean();
+                header('Content-Type: image/jpeg');
+                header('ETag: ' . $etag);
+                header('Cache-Control: public, max-age=2592000, immutable');
+                readfile($info['path']);
+                exit;
+            }
+        }
+        while (ob_get_level()) ob_end_clean();
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Location: ' . $cdn_redirect_url, true, 302);
+        exit;
+    }
+    update_option($lock_key, time(), 'no');
+
+    $try_fetch_image = function($target_url) {
         if (empty($target_url)) return null;
-        $resp = studio_remote_get($target_url, ['timeout' => 10]);
+        $resp = studio_remote_get($target_url, ['timeout' => 4]);
         if (is_wp_error($resp) || wp_remote_retrieve_response_code($resp) !== 200) {
             return null;
         }
@@ -1864,114 +2738,117 @@ add_action('init', function() {
         if ((stripos($type, 'image/') !== 0 && !studio_is_valid_image_bytes($body)) || strlen($body) <= 100) {
             return null;
         }
-
-        // Jika header menyertakan Content-Disposition dengan nama file asli, simpan ke cache metadata folder
-        if ($folder_id) {
-            $cd = (string) wp_remote_retrieve_header($resp, 'content-disposition');
-            if ($cd && preg_match('/filename\*=UTF-8\'\'([^;]+)|filename="([^"]+)"/i', $cd, $m)) {
-                $extracted_name = !empty($m[2]) ? $m[2] : rawurldecode($m[1]);
-                if ($extracted_name) {
-                    $fmeta_key = 'studio_fmeta_' . md5($folder_id);
-                    $fmeta_map = is_array(get_transient($fmeta_key)) ? get_transient($fmeta_key) : [];
-                    if (empty($fmeta_map[$id]['name']) || $fmeta_map[$id]['name'] === $id) {
-                        $fmeta_map[$id] = [
-                            'name' => $extracted_name,
-                            'thumbnailLink' => $fmeta_map[$id]['thumbnailLink'] ?? ''
-                        ];
-                        set_transient($fmeta_key, $fmeta_map, 7 * DAY_IN_SECONDS);
-                    }
-                }
-            }
-        }
-
         return ['body' => $body, 'type' => stripos($type, 'image/') === 0 ? $type : 'image/jpeg'];
     };
 
+    global $wpdb;
     $img_result = null;
 
-    // Tier 1: Gunakan thumbnailLink resmi dari cache folder (lh3.googleusercontent.com)
-    if (!empty($folder_id)) {
-        $tmap = get_transient('studio_tmap_' . md5($folder_id));
-        if (is_array($tmap) && !empty($tmap[$id])) {
-            $img_result = $try_fetch_image($tmap[$id] . '=s' . $w);
-        }
+    // Tier 1: thumbnailLink dari tabel studio_files
+    $db_tlink = $wpdb->get_var($wpdb->prepare(
+        "SELECT thumb_link FROM {$wpdb->prefix}studio_files WHERE file_id = %s AND thumb_link != '' LIMIT 1",
+        $id
+    ));
+    if (!empty($db_tlink)) {
+        $img_result = $try_fetch_image($db_tlink . '=s' . $w);
     }
 
-    // Tier 2 (Jalur Langsung Tercepat): lh3.googleusercontent.com/d/{id}=w{w}
+    // Tier 2: lh3.googleusercontent.com/d/{id}=w{w}
     if (!$img_result) {
-        $img_result = $try_fetch_image("https://lh3.googleusercontent.com/d/" . rawurlencode($id) . "=w{$w}");
+        $img_result = $try_fetch_image($cdn_redirect_url);
     }
 
-    // Tier 3: Minta thumbnailLink segar dari Drive API v3 jika belum dapat
+    // Tier 3 & 4 hanya dicoba jika Tier 1 & 2 gagal
     if (!$img_result && defined('STUDIO_GOOGLE_API_KEY') && !empty(STUDIO_GOOGLE_API_KEY)) {
         $meta_url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($id) . '?' . http_build_query([
             'fields' => 'id,name,thumbnailLink',
             'supportsAllDrives' => 'true',
             'key' => STUDIO_GOOGLE_API_KEY
         ], '', '&', PHP_QUERY_RFC3986);
-        $meta_resp = studio_remote_get($meta_url, ['timeout' => 8]);
+        $meta_resp = studio_remote_get($meta_url, ['timeout' => 4]);
         if (!is_wp_error($meta_resp) && wp_remote_retrieve_response_code($meta_resp) === 200) {
             $meta_body = json_decode(wp_remote_retrieve_body($meta_resp), true);
             if (!empty($meta_body['thumbnailLink'])) {
                 $base_turl = preg_replace('/=s\d+.*$/', '', $meta_body['thumbnailLink']);
-                if (!empty($folder_id)) {
-                    $tmap_key = 'studio_tmap_' . md5($folder_id);
-                    $tmap = is_array(get_transient($tmap_key)) ? get_transient($tmap_key) : [];
-                    $tmap[$id] = $base_turl;
-                    set_transient($tmap_key, $tmap, 7 * DAY_IN_SECONDS);
-
-                    if (!empty($meta_body['name'])) {
-                        $fmeta_key = 'studio_fmeta_' . md5($folder_id);
-                        $fmeta = is_array(get_transient($fmeta_key)) ? get_transient($fmeta_key) : [];
-                        $fmeta[$id] = ['name' => $meta_body['name'], 'thumbnailLink' => $base_turl];
-                        set_transient($fmeta_key, $fmeta, 7 * DAY_IN_SECONDS);
-                    }
-                }
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE {$wpdb->prefix}studio_files SET thumb_link = %s WHERE file_id = %s",
+                    $base_turl,
+                    $id
+                ));
                 $img_result = $try_fetch_image($base_turl . '=s' . $w);
             }
         }
     }
 
-    // Tier 4: Fallback ke drive.google.com/thumbnail
     if (!$img_result) {
         $img_result = $try_fetch_image("https://drive.google.com/thumbnail?id=" . rawurlencode($id) . "&sz=w{$w}");
     }
+
+    delete_option($lock_key);
 
     if ($img_result) {
         $body = $img_result['body'];
         $type = $img_result['type'];
 
         if (strlen($body) < 5 * 1024 * 1024) {
-            file_put_contents($cache_file, $body);
+            studio_ensure_cache_dir();
+            if (!file_exists($info['dir'])) {
+                wp_mkdir_p($info['dir']);
+            }
+            @file_put_contents($info['path'], $body);
         }
 
         while (ob_get_level()) ob_end_clean();
         header("Content-Type: $type");
-        header('Cache-Control: public, max-age=86400');
+        header('ETag: ' . $etag);
+        header('Cache-Control: public, max-age=2592000, immutable');
         echo $body;
         exit;
     }
 
-    // Jika semua tier server-side gagal, redirect 302 langsung ke CDN Google agar browser pengguna yang memuatnya
+    set_transient($fail_key, 1, 2 * MINUTE_IN_SECONDS);
     while (ob_get_level()) ob_end_clean();
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    header('Location: https://lh3.googleusercontent.com/d/' . rawurlencode($id) . '=w' . $w, true, 302);
+    header('Location: ' . $cdn_redirect_url, true, 302);
     exit;
 }, 1);
 
-// Cron untuk bersihkan cache gambar
-if (!wp_next_scheduled('studio_clean_cache_cron')) {
-    wp_schedule_event(time(), 'daily', 'studio_clean_cache_cron');
-}
+// C8: Cron pembersihan cache gambar berbasis umur (30 hari) & batas ukuran LRU (±300 MB)
 add_action('studio_clean_cache_cron', function() {
     $upload_dir = wp_upload_dir();
     $cache_dir = $upload_dir['basedir'] . '/studio-cache';
-    if (file_exists($cache_dir)) {
-        $files = glob($cache_dir . '/*');
-        $now = time();
-        foreach ((array) $files as $file) {
-            if (is_file($file) && ($now - filemtime($file) >= 7 * DAY_IN_SECONDS)) {
-                unlink($file);
+    if (!is_dir($cache_dir)) return;
+
+    $now = time();
+    $max_age = 30 * DAY_IN_SECONDS;
+    $max_bytes = 300 * 1024 * 1024;
+    $target_bytes = 250 * 1024 * 1024;
+    $total_bytes = 0;
+    $entries = [];
+
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($cache_dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $fi) {
+        if (!$fi->isFile() || substr($fi->getFilename(), -4) !== '.jpg') continue;
+        $path = $fi->getPathname();
+        $mtime = (int) $fi->getMTime();
+        $size = (int) $fi->getSize();
+
+        if (($now - $mtime) >= $max_age) {
+            @unlink($path);
+            continue;
+        }
+        $total_bytes += $size;
+        $entries[] = ['path' => $path, 'mtime' => $mtime, 'size' => $size];
+    }
+
+    if ($total_bytes > $max_bytes && !empty($entries)) {
+        usort($entries, function($a, $b) {
+            return $a['mtime'] <=> $b['mtime'];
+        });
+        foreach ($entries as $ent) {
+            if ($total_bytes <= $target_bytes) break;
+            if (@unlink($ent['path'])) {
+                $total_bytes -= $ent['size'];
             }
         }
     }
@@ -1991,6 +2868,13 @@ add_action('template_redirect', function() {
     remove_action('wp_head', 'bcs_lazy_placeholder_css', 99);
     remove_action('wp_footer', 'bcs_lazy_observer_js', 5);
     remove_action('wp_head', 'bcs_hide_amelia_payment_step');
+}, 1);
+
+// Fase D: Preconnect Google Fonts untuk mempercepat render awal
+add_action('wp_head', function() {
+    if (!studio_is_studio_page()) return;
+    echo '<link rel="preconnect" href="https://fonts.googleapis.com">' . "\n";
+    echo '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>' . "\n";
 }, 1);
 
 add_action('wp_enqueue_scripts', function() {
@@ -2090,18 +2974,18 @@ add_filter('body_class', function($classes) {
     return $classes;
 });
 
-// 5.8 Pembantu template
+// 5.8 Pembantu template (E1: gunakan class CSS, tanpa inline style)
 function studio_render_shell($role) {
     if ($role === 'editor' && current_user_can('manage_options')) {
         $client_url = studio_build_page_url('template-studio-client.php');
         if (!$client_url) {
-            echo '<div style="background: #b30000; color: white; padding: 12px 16px; text-align: center; font-family: sans-serif; font-weight: 600;">⚠️ Peringatan Admin: Buat dan Publish sebuah Page dengan template "Studio Client" agar link klien dapat bekerja.</div>';
+            echo '<div class="st-admin-warning">⚠️ Peringatan Admin: Buat dan Publish sebuah Page dengan template "Studio Client" agar link klien dapat bekerja.</div>';
         }
     }
 
     echo '<div id="st-app" class="st-app st-' . esc_attr($role) . '">';
-    echo '<div style="padding: 50px; text-align: center;">Memuat...</div>';
-    echo '<noscript><div style="padding: 50px; text-align: center; color: red;">JavaScript harus diaktifkan.</div></noscript>';
+    echo '<div class="st-shell-loading">Memuat...</div>';
+    echo '<noscript><div class="st-shell-noscript">JavaScript harus diaktifkan.</div></noscript>';
     echo '</div>';
 }
 

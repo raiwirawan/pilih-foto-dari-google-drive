@@ -90,8 +90,9 @@
       if (key) headers['X-Studio-Key'] = key;
     }
 
+    const allowEtagRevalidate = (path === '/client/photos' || path === '/client/result');
     const res = await fetch(url, {
-      cache: 'no-store',
+      cache: allowEtagRevalidate ? 'no-cache' : 'no-store',
       ...options,
       headers: { ...headers, ...(options.headers || {}) }
     });
