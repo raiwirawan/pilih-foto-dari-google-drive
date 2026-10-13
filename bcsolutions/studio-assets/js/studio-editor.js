@@ -1,6 +1,6 @@
 /* studio-editor.js */
 (function() {
-  const { apiFetch, esc, openDialog, closeDialog, toast, copyText, extractFolderId } = window.StudioApp;
+  const { apiFetch, esc, openDialog, closeDialog, toast, confirmDialog, copyText, extractFolderId } = window.StudioApp;
 
   let galleries = [], currentPhotos = [], currentCur = 0;
   let activeGalleryId = null, currentCsvUrl = null, pollTimer = null;
@@ -211,16 +211,23 @@
       };
 
       $('st-rotateKeyBtn').onclick = async () => {
-        if (!confirm('Perhatian: Melakukan rotasi kunci akan membuat link lama hangus. Semua editor yang sedang menggunakan link lama akan keluar kecuali membuka link baru. Lanjutkan?')) return;
+        const ok = await confirmDialog({
+          title: 'Rotasi Kunci Editor?',
+          message: 'Link editor yang lama akan hangus. Semua editor yang sedang menggunakan link lama harus membuka link baru.',
+          confirmText: 'Ya, Rotasi Kunci',
+          cancelText: 'Batal',
+          variant: 'danger'
+        });
+        if (!ok) return;
         try {
           const resRotate = await apiFetch('/editor/key/rotate', { method: 'POST' });
           if (resRotate.key) {
             localStorage.setItem('st_editor_key', resRotate.key);
           }
-          toast('Kunci berhasil dirotasi. Silakan salin link yang baru.');
+          toast('Kunci berhasil dirotasi. Silakan salin link yang baru.', 'success');
           loadAdminPanel();
         } catch (e) {
-          toast(e.message);
+          toast(e.message, 'error');
         }
       };
 
@@ -405,50 +412,71 @@
   }
 
   async function reopenGallery(id) {
-    if (!confirm('Buka kembali akses untuk klien ini agar bisa mengubah pilihannya?')) return;
+    const ok = await confirmDialog({
+      title: 'Buka Kembali Akses Klien?',
+      message: 'Klien akan dapat mengubah dan mengirim ulang pilihan fotonya.',
+      confirmText: 'Ya, Buka Akses',
+      cancelText: 'Batal',
+      variant: 'warning'
+    });
+    if (!ok) return;
     try {
       await apiFetch(`/editor/galleries/${id}/reopen`, { method: 'POST' });
-      toast('Akses dibuka kembali');
+      toast('Akses klien berhasil dibuka kembali', 'success');
       await loadGalleries();
       if (activeGalleryId && String(activeGalleryId) === String(id)) {
         viewGallery(id, false);
       }
     } catch (e) {
-      toast(e.message);
+      toast(e.message, 'error');
     }
   }
 
   async function regenerateClientToken() {
     const id = $('st-mId').value;
     if (!id) return;
-    if (!confirm('Buat ulang link untuk klien ini? Link klien yang lama tidak akan bisa diakses lagi.')) return;
+    const ok = await confirmDialog({
+      title: 'Buat Ulang Link Klien?',
+      message: 'Link klien yang lama tidak akan bisa diakses lagi. Pastikan Anda mengirimkan link baru kepada klien.',
+      confirmText: 'Ya, Buat Ulang',
+      cancelText: 'Batal',
+      variant: 'warning'
+    });
+    if (!ok) return;
     try {
       const res = await apiFetch(`/editor/galleries/${id}/regenerate-token`, { method: 'POST' });
       await loadGalleries();
       if (res.link) {
         await copyText(res.link, 'Link klien baru berhasil dibuat & disalin!');
       } else {
-        toast('Token klien berhasil diperbarui');
+        toast('Token klien berhasil diperbarui', 'success');
       }
     } catch (e) {
-      toast(e.message);
+      toast(e.message, 'error');
     }
   }
 
   async function deleteGallery() {
     const id = $('st-mId').value;
     if (!id) return;
-    if (!confirm('Yakin ingin menghapus galeri ini beserta seluruh data pilihan klien?')) return;
+    const ok = await confirmDialog({
+      title: 'Hapus Galeri Ini?',
+      message: 'Galeri beserta seluruh data pilihan foto klien akan dihapus secara permanen.',
+      confirmText: 'Ya, Hapus Galeri',
+      cancelText: 'Batal',
+      variant: 'danger'
+    });
+    if (!ok) return;
     try {
       await apiFetch(`/editor/galleries/${id}`, { method: 'DELETE' });
-      toast('Galeri dihapus');
+      toast('Galeri berhasil dihapus', 'success');
       closeDialog('st-manageDlg');
       if (activeGalleryId && String(activeGalleryId) === String(id)) {
         closeDetailPanel();
       }
       loadGalleries();
     } catch (e) {
-      toast(e.message);
+      toast(e.message, 'error');
     }
   }
 
@@ -784,15 +812,22 @@
         if (id) {
           const existing = galleries.find(x => String(x.id) === String(id));
           if (existing && existing.source_folder_id !== validatedFolderId && Number(existing.selected_count) > 0) {
-            if (!confirm('Folder mentah diubah! Pilihan foto klien yang sudah ada akan di-reset. Lanjutkan?')) {
+            const ok = await confirmDialog({
+              title: 'Folder Mentah Diubah!',
+              message: 'Pilihan foto klien yang sudah ada pada galeri ini akan di-reset. Apakah Anda yakin ingin melanjutkan?',
+              confirmText: 'Ya, Reset & Simpan',
+              cancelText: 'Batal',
+              variant: 'danger'
+            });
+            if (!ok) {
               return;
             }
           }
           await apiFetch(`/editor/galleries/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
-          toast('Galeri berhasil disimpan');
+          toast('Galeri berhasil disimpan', 'success');
         } else {
           await apiFetch('/editor/galleries', { method: 'POST', body: JSON.stringify(body) });
-          toast('Galeri berhasil dibuat');
+          toast('Galeri berhasil dibuat', 'success');
         }
 
         closeDialog('st-manageDlg');
@@ -801,7 +836,7 @@
           viewGallery(id, false);
         }
       } catch (err) {
-        toast(err.message);
+        toast(err.message, 'error');
       } finally {
         $('st-mSubmit').disabled = false;
       }

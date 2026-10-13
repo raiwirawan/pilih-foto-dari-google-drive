@@ -1010,6 +1010,9 @@ function studio_ensure_cache_dir() {
 
 function studio_install_db() {
     global $wpdb;
+    $prev_suppress = $wpdb->suppress_errors(true);
+    ob_start();
+
     $table_galleries = $wpdb->prefix . 'studio_galleries';
     $table_files = $wpdb->prefix . 'studio_files';
     $charset_collate = $wpdb->get_charset_collate();
@@ -1037,8 +1040,8 @@ function studio_install_db() {
     ) $charset_collate;";
 
     $sql_files = "CREATE TABLE $table_files (
-        file_id varchar(100) NOT NULL,
-        folder_id varchar(100) NOT NULL,
+        file_id varchar(80) NOT NULL,
+        folder_id varchar(80) NOT NULL,
         name varchar(255) NOT NULL,
         mime varchar(100) NOT NULL DEFAULT '',
         thumb_link text NULL,
@@ -1076,11 +1079,14 @@ function studio_install_db() {
     );
 
     studio_ensure_cache_dir();
-    update_option('studio_db_version', '1.1');
+    update_option('studio_db_version', '1.2');
+
+    @ob_end_clean();
+    $wpdb->suppress_errors($prev_suppress);
 }
 
 add_action('init', function() {
-    if (get_option('studio_db_version') !== '1.1') {
+    if (get_option('studio_db_version') !== '1.2') {
         studio_install_db();
     }
     if (!get_option('studio_cron_installed')) {
@@ -1143,18 +1149,40 @@ function studio_verify_editor(WP_REST_Request $request) {
     return new WP_Error('unauthorized', 'Kunci editor tidak valid atau sudah diganti.', ['status' => 401]);
 }
 
-// C9: Header respons REST API studio/v1 (dukung ETag/304 khusus /client/photos dan /client/result, lainnya no-store)
+// Proteksi Output JSON REST API studio/v1 agar tidak pernah tercemar PHP Notice/Warning/DB Error
+add_filter('rest_pre_dispatch', function($result, $server, $request) {
+    $route = $request->get_route();
+    if (strpos($route, '/studio/v1') === 0) {
+        global $wpdb;
+        $wpdb->suppress_errors(true);
+        @ini_set('display_errors', '0');
+        ob_start();
+        $GLOBALS['studio_rest_ob_active'] = true;
+    }
+    return $result;
+}, 1, 3);
+
+add_filter('rest_pre_serve_request', function($served, $result, $request, $server) {
+    $route = $request->get_route();
+    if (strpos($route, '/studio/v1') === 0) {
+        if (!empty($GLOBALS['studio_rest_ob_active']) && ob_get_level() > 0) {
+            @ob_end_clean();
+            $GLOBALS['studio_rest_ob_active'] = false;
+        }
+        if (ob_get_level() > 0 && ob_get_length() > 0) {
+            @ob_clean();
+        }
+    }
+    return $served;
+}, 1, 4);
+
+// C9: Header respons REST API studio/v1
 add_filter('rest_post_dispatch', function($response, $server, $request) {
     $route = $request->get_route();
     if (strpos($route, '/studio/v1') === 0 && $response instanceof WP_REST_Response) {
-        $headers = $response->get_headers();
-        if (($route === '/studio/v1/client/photos' || $route === '/studio/v1/client/result') && !empty($headers['ETag'])) {
-            $response->header('Cache-Control', 'private, no-cache, must-revalidate');
-        } else {
-            $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-            $response->header('Pragma', 'no-cache');
-            $response->header('Expires', '0');
-        }
+        $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        $response->header('Pragma', 'no-cache');
+        $response->header('Expires', '0');
     }
     return $response;
 }, 10, 3);
@@ -1208,12 +1236,17 @@ add_action('rest_api_init', function() {
         'permission_callback' => 'studio_verify_editor'
     ]);
     register_rest_route('studio/v1', '/editor/galleries/(?P<id>\d+)', [
-        'methods' => 'PATCH',
+        'methods' => ['PATCH', 'POST'],
         'callback' => 'studio_api_editor_update_gallery',
         'permission_callback' => 'studio_verify_editor'
     ]);
     register_rest_route('studio/v1', '/editor/galleries/(?P<id>\d+)', [
         'methods' => 'DELETE',
+        'callback' => 'studio_api_editor_delete_gallery',
+        'permission_callback' => 'studio_verify_editor'
+    ]);
+    register_rest_route('studio/v1', '/editor/galleries/(?P<id>\d+)/delete', [
+        'methods' => 'POST',
         'callback' => 'studio_api_editor_delete_gallery',
         'permission_callback' => 'studio_verify_editor'
     ]);
@@ -1248,7 +1281,7 @@ add_action('rest_api_init', function() {
         'permission_callback' => 'studio_verify_editor'
     ]);
     register_rest_route('studio/v1', '/editor/settings', [
-        'methods' => 'PATCH',
+        'methods' => ['PATCH', 'POST'],
         'callback' => function(WP_REST_Request $request) {
             $wa = preg_replace('/[^0-9]/', '', (string) $request->get_param('whatsapp'));
             update_option('studio_whatsapp', $wa);
@@ -1736,50 +1769,58 @@ function studio_resolve_missing_names_parallel(array $file_ids, $folder_id = '')
     $batches = array_chunk($missing, 6);
 
     foreach ($batches as $batch) {
+        $handled_parallel = false;
         if (class_exists('WpOrg\Requests\Requests') || class_exists('Requests')) {
-            $requests = [];
-            foreach ($batch as $fid) {
-                $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($fid) . '?' . http_build_query([
-                    'fields' => 'id,name,mimeType,thumbnailLink',
-                    'supportsAllDrives' => 'true',
-                    'key' => STUDIO_GOOGLE_API_KEY
-                ], '', '&', PHP_QUERY_RFC3986);
-                $requests[$fid] = [
-                    'url' => $url,
-                    'headers' => [
-                        'Accept' => 'application/json',
-                        'Referer' => home_url('/')
-                    ],
-                    'type' => 'GET'
-                ];
-            }
+            try {
+                $requests = [];
+                foreach ($batch as $fid) {
+                    $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($fid) . '?' . http_build_query([
+                        'fields' => 'id,name,mimeType,thumbnailLink',
+                        'supportsAllDrives' => 'true',
+                        'key' => STUDIO_GOOGLE_API_KEY
+                    ], '', '&', PHP_QUERY_RFC3986);
+                    $requests[$fid] = [
+                        'url' => $url,
+                        'headers' => [
+                            'Accept' => 'application/json',
+                            'Referer' => home_url('/')
+                        ],
+                        'type' => 'GET'
+                    ];
+                }
 
-            $options = ['timeout' => 6, 'connect_timeout' => 4];
-            $responses = class_exists('WpOrg\Requests\Requests')
-                ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
-                : \Requests::request_multiple($requests, $options);
+                $options = ['timeout' => 6, 'connect_timeout' => 4];
+                $responses = class_exists('WpOrg\Requests\Requests')
+                    ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
+                    : \Requests::request_multiple($requests, $options);
 
-            foreach ($responses as $fid => $resp) {
-                if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
-                    $body = json_decode($resp->body, true);
-                    if (!empty($body['name']) && $body['name'] !== $fid) {
-                        $resolved[$fid] = (string) $body['name'];
-                        if ($folder_id) {
-                            $tUrl = !empty($body['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $body['thumbnailLink']) : '';
-                            $wpdb->replace($table_files, [
-                                'file_id' => $fid,
-                                'folder_id' => $folder_id,
-                                'name' => (string) $body['name'],
-                                'mime' => (string) ($body['mimeType'] ?? ''),
-                                'thumb_link' => $tUrl,
-                                'position' => 999999,
-                                'synced_at' => $sync_time
-                            ]);
+                foreach ((array) $responses as $fid => $resp) {
+                    if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
+                        $body = json_decode($resp->body, true);
+                        if (!empty($body['name']) && $body['name'] !== $fid) {
+                            $resolved[$fid] = (string) $body['name'];
+                            if ($folder_id) {
+                                $tUrl = !empty($body['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $body['thumbnailLink']) : '';
+                                $wpdb->replace($table_files, [
+                                    'file_id' => $fid,
+                                    'folder_id' => $folder_id,
+                                    'name' => (string) $body['name'],
+                                    'mime' => (string) ($body['mimeType'] ?? ''),
+                                    'thumb_link' => $tUrl,
+                                    'position' => 999999,
+                                    'synced_at' => $sync_time
+                                ]);
+                            }
                         }
                     }
                 }
+                $handled_parallel = true;
+            } catch (\Throwable $e) {
+                $handled_parallel = false;
             }
-        } else {
+        }
+
+        if (!$handled_parallel) {
             foreach ($batch as $fid) {
                 $url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($fid) . '?' . http_build_query([
                     'fields' => 'id,name,mimeType,thumbnailLink',
@@ -1925,37 +1966,39 @@ function studio_prefetch_thumbs($folder_id, $max_files = 48) {
 
     foreach ($batches as $batch) {
         if (class_exists('WpOrg\Requests\Requests') || class_exists('Requests')) {
-            $requests = [];
-            foreach ($batch as $idx => $item) {
-                $url = !empty($item['thumb_link'])
-                    ? ($item['thumb_link'] . '=s400')
-                    : ('https://lh3.googleusercontent.com/d/' . rawurlencode($item['id']) . '=w400');
-                $requests[$idx] = [
-                    'url' => $url,
-                    'headers' => [
-                        'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-                        'Accept' => 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-                    ],
-                    'type' => 'GET'
-                ];
-            }
-            $options = ['timeout' => 5, 'connect_timeout' => 4];
-            $responses = class_exists('WpOrg\Requests\Requests')
-                ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
-                : \Requests::request_multiple($requests, $options);
+            try {
+                $requests = [];
+                foreach ($batch as $idx => $item) {
+                    $url = !empty($item['thumb_link'])
+                        ? ($item['thumb_link'] . '=s400')
+                        : ('https://lh3.googleusercontent.com/d/' . rawurlencode($item['id']) . '=w400');
+                    $requests[$idx] = [
+                        'url' => $url,
+                        'headers' => [
+                            'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                            'Accept' => 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+                        ],
+                        'type' => 'GET'
+                    ];
+                }
+                $options = ['timeout' => 5, 'connect_timeout' => 4];
+                $responses = class_exists('WpOrg\Requests\Requests')
+                    ? \WpOrg\Requests\Requests::request_multiple($requests, $options)
+                    : \Requests::request_multiple($requests, $options);
 
-            foreach ($responses as $idx => $resp) {
-                if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
-                    if (studio_is_valid_image_bytes($resp->body) && strlen($resp->body) < 5 * 1024 * 1024) {
-                        $info = $batch[$idx]['info'];
-                        if (!file_exists($info['dir'])) {
-                            wp_mkdir_p($info['dir']);
+                foreach ((array) $responses as $idx => $resp) {
+                    if (is_object($resp) && isset($resp->status_code) && (int) $resp->status_code === 200 && !empty($resp->body)) {
+                        if (studio_is_valid_image_bytes($resp->body) && strlen($resp->body) < 5 * 1024 * 1024) {
+                            $info = $batch[$idx]['info'];
+                            if (!file_exists($info['dir'])) {
+                                wp_mkdir_p($info['dir']);
+                            }
+                            @file_put_contents($info['path'], $resp->body);
+                            $cached++;
                         }
-                        @file_put_contents($info['path'], $resp->body);
-                        $cached++;
                     }
                 }
-            }
+            } catch (\Throwable $e) {}
         }
     }
 
@@ -2478,10 +2521,6 @@ function studio_api_client_get_photos(WP_REST_Request $request) {
     $synced_at = is_array($sync_meta) && !empty($sync_meta['synced_at']) ? $sync_meta['synced_at'] : '';
     $etag = 'W/"st-p-' . md5($g->source_folder_id . '|' . count($index) . '|' . $synced_at) . '"';
 
-    if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim((string) $_SERVER['HTTP_IF_NONE_MATCH']) === $etag) {
-        return new WP_REST_Response(null, 304, ['ETag' => $etag]);
-    }
-
     $photos = [];
     foreach ($index as $p) {
         $photos[] = studio_format_client_photo_item($p, $g->source_folder_id);
@@ -2508,10 +2547,6 @@ function studio_api_client_get_result(WP_REST_Request $request) {
     $sync_meta = get_option('studio_sync_' . md5($g->result_folder_id));
     $synced_at = is_array($sync_meta) && !empty($sync_meta['synced_at']) ? $sync_meta['synced_at'] : '';
     $etag = 'W/"st-r-' . md5($g->result_folder_id . '|' . count($index) . '|' . $synced_at) . '"';
-
-    if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim((string) $_SERVER['HTTP_IF_NONE_MATCH']) === $etag) {
-        return new WP_REST_Response(null, 304, ['ETag' => $etag]);
-    }
 
     $photos = [];
     foreach ($index as $p) {

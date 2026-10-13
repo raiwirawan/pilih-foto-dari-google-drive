@@ -1,6 +1,6 @@
 /* studio-client.js */
 (function() {
-  const { apiFetch, esc, openDialog, closeDialog, toast } = window.StudioApp;
+  const { apiFetch, esc, openDialog, closeDialog, toast, confirmDialog } = window.StudioApp;
 
   let gallery = null, photos = [], resultPhotos = [], sel = new Set(), cur = 0;
   let statusData = { status: 'unstarted', selectedIds: [], note: '' };
@@ -223,7 +223,7 @@
       $('st-note').value = statusData.note || '';
     } else if (statusData.status === 'reopened') {
       bC.style.display = 'block';
-      bText.className = 'st-banner';
+      bText.className = 'st-banner st-reopened';
       bText.innerHTML = `<span>✨ Editor telah membuka kembali akses. Kamu bisa mengubah dan mengirim ulang pilihan foto.</span>`;
     } else {
       bC.style.display = 'none';
@@ -285,10 +285,11 @@
       const token = sessionStorage.getItem('st_token') || localStorage.getItem('st_token') || '';
       try {
         fetch((config.apiBase || '') + '/client/selection', {
-          method: 'PUT',
+          method: 'POST',
           keepalive: true,
           headers: {
             'Content-Type': 'application/json',
+            'X-HTTP-Method-Override': 'PUT',
             'X-Studio-Token': token
           },
           body: JSON.stringify(payload)
@@ -402,21 +403,22 @@
     updateOpacity();
   }
 
-  // D2: Opacity cukup toggle 1 class pada #st-grid
+  // D2: Opacity & lock overlay cukup toggle class pada #st-grid
   function updateOpacity() {
     const grid = $('st-grid');
     if (!grid) return;
     const limitReached = !inResultView && Boolean(gallery && gallery.maxSelect && sel.size >= gallery.maxSelect);
     grid.classList.toggle('st-limit-reached', limitReached);
+    grid.classList.toggle('st-grid-locked', !inResultView && isLocked);
   }
 
   function toggle(id) {
     if (isLocked) {
-      toast('Pilihan sudah dikunci oleh sistem');
+      toast('Pilihan sudah dikunci. Hubungi editor jika ingin mengubah pilihan.', 'warning');
       return;
     }
     if (!sel.has(id) && gallery.maxSelect && sel.size >= gallery.maxSelect) {
-      toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`);
+      toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`, 'warning');
       return;
     }
     const willSelect = !sel.has(id);
@@ -545,7 +547,7 @@
     $('st-allBtn').onclick = () => {
       if (isLocked) return;
       if (gallery.maxSelect && photos.length > gallery.maxSelect) {
-        toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`);
+        toast(`Maksimal pilihan adalah ${gallery.maxSelect} foto`, 'warning');
         return;
       }
       photos.forEach(p => {
@@ -558,11 +560,19 @@
       updateOpacity();
       scheduleSaveIds();
       checkStatus();
+      toast(`Semua ${photos.length} foto berhasil dipilih`, 'success');
     };
 
-    $('st-resetBtn').onclick = () => {
-      if (isLocked) return;
-      if (sel.size && confirm('Hapus semua pilihan foto?')) {
+    $('st-resetBtn').onclick = async () => {
+      if (isLocked || !sel.size) return;
+      const ok = await confirmDialog({
+        title: 'Hapus Semua Pilihan?',
+        message: `Sebanyak ${sel.size} foto yang sudah Anda pilih akan dibatalkan pilihannya.`,
+        confirmText: 'Ya, Hapus Pilihan',
+        cancelText: 'Batal',
+        variant: 'danger'
+      });
+      if (ok) {
         sel.forEach(id => {
           const el = cardMap.get(id);
           if (el) el.classList.remove('st-selected');
@@ -571,6 +581,7 @@
         updateOpacity();
         scheduleSaveIds();
         checkStatus();
+        toast('Semua pilihan foto telah dihapus', 'info');
       }
     };
 
@@ -655,6 +666,7 @@
         setSaveStatus('Terkirim ✓', 'st-saved');
         checkStatus();
         updateOpacity();
+        toast('Pilihan foto berhasil dikirim & dikunci!', 'success');
 
         $('st-dlgForm').style.display = 'none';
         $('st-dlgSuccess').style.display = 'block';
@@ -665,7 +677,7 @@
           $('st-waBtn').style.display = 'flex';
         }
       } catch (e) {
-        toast(e.message);
+        toast(e.message, 'error');
       } finally {
         $('st-confirmSubmitBtn').disabled = false;
       }
