@@ -1,0 +1,6 @@
+
+# macOS
+.DS_Store
+
+# config php wordpress
+wp-config.php
