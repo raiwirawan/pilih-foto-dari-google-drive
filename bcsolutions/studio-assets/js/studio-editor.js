@@ -488,6 +488,28 @@
   }
 
   // --- Detail View (B7, B9, D8, D9, D10) ---
+  function getImageCandidates(pItem, isLg = false) {
+    const list = [];
+    const main = isLg ? (pItem.srcLg || pItem.src) : pItem.src;
+    const fallback = isLg ? (pItem.fallbackSrcLg || pItem.fallbackSrc) : pItem.fallbackSrc;
+    const fallbacksList = isLg ? (pItem.fallbacksLg || pItem.fallbacks) : pItem.fallbacks;
+
+    if (main) list.push(main);
+    if (Array.isArray(fallbacksList)) {
+      fallbacksList.forEach(u => {
+        if (u && !list.includes(u)) list.push(u);
+      });
+    }
+    if (fallback && !list.includes(fallback)) list.push(fallback);
+
+    if (!String(pItem.id).startsWith('demo')) {
+      const sz = isLg ? 1600 : 400;
+      const gThumb = `https://drive.google.com/thumbnail?id=${encodeURIComponent(pItem.id)}&sz=w${sz}`;
+      if (!list.includes(gThumb)) list.push(gThumb);
+    }
+    return list;
+  }
+
   function renderDetailData(id, data) {
     $('st-detailTitle').textContent = data.title;
     if ($('st-detailSyncInfo')) {
@@ -570,6 +592,7 @@
       retryWrap.className = 'st-img-retry-wrap';
       retryWrap.innerHTML = `<span>Gagal memuat pratinjau</span><button type="button" class="st-retry-img-btn" data-i="${i}">↻ Muat ulang</button>`;
 
+      const candidates = getImageCandidates(p, false);
       const img = document.createElement('img');
       img.width = 400;
       img.height = 400;
@@ -577,20 +600,21 @@
       img.alt = p.name || '(nama belum tersedia)';
       img.loading = i < 8 ? 'eager' : 'lazy';
       img.decoding = 'async';
+
+      let attempt = 0;
       img.onload = () => {
         card.classList.remove('st-img-error');
         card.classList.add('st-img-loaded');
       };
       img.onerror = () => {
-        const isDemo = String(p.id).startsWith('demo');
-        if (!isDemo && !img.dataset.fallbackTried && p.fallbackSrc && img.src !== p.fallbackSrc) {
-          img.dataset.fallbackTried = '1';
-          img.src = p.fallbackSrc;
+        attempt++;
+        if (attempt < candidates.length) {
+          img.src = candidates[attempt];
         } else {
           card.classList.add('st-img-error');
         }
       };
-      img.src = p.src;
+      img.src = candidates[0] || p.src;
 
       const overlay = document.createElement('div');
       overlay.className = 'st-photo-card__overlay';
@@ -628,11 +652,22 @@
         e.stopPropagation();
         const card = retryBtn.closest('.st-photo-card');
         const idx = parseInt(card.dataset.i, 10);
+        const p = currentPhotos[idx];
         const img = card.querySelector('img');
-        if (img && currentPhotos[idx]) {
+        if (img && p) {
           card.classList.remove('st-img-error');
-          delete img.dataset.fallbackTried;
-          img.src = currentPhotos[idx].src;
+          const candidates = getImageCandidates(p, false);
+          let attempt = 0;
+          img.onerror = () => {
+            attempt++;
+            if (attempt < candidates.length) {
+              img.src = candidates[attempt] + (candidates[attempt].includes('?') ? '&' : '?') + '_t=' + Date.now();
+            } else {
+              card.classList.add('st-img-error');
+            }
+          };
+          const first = candidates[0] || p.src;
+          img.src = first + (first.includes('?') ? '&' : '?') + '_t=' + Date.now();
         }
         return;
       }
@@ -697,16 +732,15 @@
     if (!p) return;
     const lbImg = $('st-lbimg');
     lbImg.referrerPolicy = 'no-referrer';
-    delete lbImg.dataset.fallbackTried;
+    const candidates = getImageCandidates(p, true);
+    let attempt = 0;
     lbImg.onerror = () => {
-      const isDemo = String(p.id).startsWith('demo');
-      const fb = p.fallbackSrcLg || `https://lh3.googleusercontent.com/d/${encodeURIComponent(p.id)}=w1600`;
-      if (!isDemo && !lbImg.dataset.fallbackTried && lbImg.src !== fb) {
-        lbImg.dataset.fallbackTried = '1';
-        lbImg.src = fb;
+      attempt++;
+      if (attempt < candidates.length) {
+        lbImg.src = candidates[attempt];
       }
     };
-    lbImg.src = p.srcLg || p.src;
+    lbImg.src = candidates[0] || p.srcLg || p.src;
     const displayLabel = (!p.nameMissing && p.name) ? p.name : '(nama belum tersedia)';
     lbImg.alt = displayLabel;
     $('st-lbname').textContent = `${displayLabel} (${currentCur + 1} / ${currentPhotos.length})`;

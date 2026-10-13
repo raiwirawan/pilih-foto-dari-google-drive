@@ -1468,6 +1468,85 @@ function studio_get_thumb_url($file_id, $w, $folder_id = '') {
     return studio_sign_url($file_id, $info['w'], $folder_id);
 }
 
+// Helper cerdas pembuat URL gambar multi-tier (statis lokal -> direct Google CDN -> proxy -> drive thumbnail)
+function studio_build_thumb_urls($file_id, $thumb_link = '', $folder_id = '') {
+    $is_demo = strpos($file_id, 'demo') === 0;
+    if ($is_demo) {
+        $link = !empty($thumb_link) ? $thumb_link : '';
+        return [
+            'src' => $link,
+            'srcLg' => $link,
+            'fallbackSrc' => $link,
+            'fallbackSrcLg' => $link,
+            'fallbacks' => [],
+            'fallbacksLg' => []
+        ];
+    }
+
+    $c400 = studio_thumb_cache_info($file_id, 400);
+    $c1600 = studio_thumb_cache_info($file_id, 1600);
+
+    $cached400 = (file_exists($c400['path']) && filesize($c400['path']) > 100) ? $c400['url'] : '';
+    $cached1600 = (file_exists($c1600['path']) && filesize($c1600['path']) > 100) ? $c1600['url'] : '';
+
+    $proxy400 = studio_sign_url($file_id, 400, $folder_id);
+    $proxy1600 = studio_sign_url($file_id, 1600, $folder_id);
+
+    // Direct Google CDN thumbnail URL jika thumb_link tersedia
+    $cdn400 = '';
+    $cdn1600 = '';
+    if (!empty($thumb_link)) {
+        if (strpos($thumb_link, 'drive.google.com/thumbnail') !== false) {
+            $cdn400 = add_query_arg(['sz' => 'w400'], $thumb_link);
+            $cdn1600 = add_query_arg(['sz' => 'w1600'], $thumb_link);
+        } else {
+            $base = preg_replace('/=[sw]\d+.*$/', '', $thumb_link);
+            $cdn400 = $base . '=s400';
+            $cdn1600 = $base . '=s1600';
+        }
+    }
+
+    // Google thumbnail endpoint bawaan Google Drive
+    $driveThumb400 = 'https://drive.google.com/thumbnail?id=' . rawurlencode($file_id) . '&sz=w400';
+    $driveThumb1600 = 'https://drive.google.com/thumbnail?id=' . rawurlencode($file_id) . '&sz=w1600';
+
+    $lh3_400 = 'https://lh3.googleusercontent.com/d/' . rawurlencode($file_id) . '=w400';
+    $lh3_1600 = 'https://lh3.googleusercontent.com/d/' . rawurlencode($file_id) . '=w1600';
+
+    // Prioritas w=400:
+    $candidates400 = [];
+    if ($cached400) $candidates400[] = $cached400;
+    if ($cdn400) $candidates400[] = $cdn400;
+    $candidates400[] = $proxy400;
+    $candidates400[] = $driveThumb400;
+    $candidates400[] = $lh3_400;
+
+    $candidates400 = array_values(array_unique(array_filter($candidates400)));
+    $primary400 = $candidates400[0];
+    $fallbacks400 = array_values(array_slice($candidates400, 1));
+
+    // Prioritas w=1600:
+    $candidates1600 = [];
+    if ($cached1600) $candidates1600[] = $cached1600;
+    if ($cdn1600) $candidates1600[] = $cdn1600;
+    $candidates1600[] = $proxy1600;
+    $candidates1600[] = $driveThumb1600;
+    $candidates1600[] = $lh3_1600;
+
+    $candidates1600 = array_values(array_unique(array_filter($candidates1600)));
+    $primary1600 = $candidates1600[0];
+    $fallbacks1600 = array_values(array_slice($candidates1600, 1));
+
+    return [
+        'src' => $primary400,
+        'srcLg' => $primary1600,
+        'fallbackSrc' => $fallbacks400[0] ?? $driveThumb400,
+        'fallbackSrcLg' => $fallbacks1600[0] ?? $driveThumb1600,
+        'fallbacks' => $fallbacks400,
+        'fallbacksLg' => $fallbacks1600,
+    ];
+}
+
 // B2: Sinkronisasi penuh folder Google Drive ke tabel persisten studio_files
 function studio_sync_folder($folder_id) {
     global $wpdb;
@@ -1560,7 +1639,9 @@ function studio_sync_folder($folder_id) {
 
         foreach (($body['files'] ?? []) as $f) {
             if (empty($f['id']) || empty($f['name'])) continue;
-            $tUrl = !empty($f['thumbnailLink']) ? preg_replace('/=s\d+.*$/', '', $f['thumbnailLink']) : '';
+            $tUrl = !empty($f['thumbnailLink'])
+                ? preg_replace('/=s\d+.*$/', '', $f['thumbnailLink'])
+                : ('https://drive.google.com/thumbnail?id=' . rawurlencode($f['id']));
             $raw_files[] = [
                 'id' => (string) $f['id'],
                 'name' => (string) $f['name'],
@@ -1969,9 +2050,16 @@ function studio_prefetch_thumbs($folder_id, $max_files = 48) {
             try {
                 $requests = [];
                 foreach ($batch as $idx => $item) {
-                    $url = !empty($item['thumb_link'])
-                        ? ($item['thumb_link'] . '=s400')
-                        : ('https://lh3.googleusercontent.com/d/' . rawurlencode($item['id']) . '=w400');
+                    $url = '';
+                    if (!empty($item['thumb_link'])) {
+                        if (strpos($item['thumb_link'], 'drive.google.com/thumbnail') !== false) {
+                            $url = add_query_arg(['sz' => 'w400'], $item['thumb_link']);
+                        } else {
+                            $url = preg_replace('/=[sw]\d+.*$/', '', $item['thumb_link']) . '=s400';
+                        }
+                    } else {
+                        $url = 'https://drive.google.com/thumbnail?id=' . rawurlencode($item['id']) . '&sz=w400';
+                    }
                     $requests[$idx] = [
                         'url' => $url,
                         'headers' => [
@@ -2273,15 +2361,14 @@ function studio_build_editor_gallery_detail($g, $force_refresh = false) {
             $missing_count++;
         }
 
-        $selected_photos[] = [
+        $db_thumb = isset($db_files[$sid]) ? (string) ($db_files[$sid]->thumb_link ?? '') : '';
+        $thumb_urls = studio_build_thumb_urls($sid, $db_thumb, $g->source_folder_id);
+
+        $selected_photos[] = array_merge([
             'id' => $sid,
             'name' => $name,
             'nameMissing' => $name_missing,
-            'src' => studio_get_thumb_url($sid, 400, $g->source_folder_id),
-            'srcLg' => studio_get_thumb_url($sid, 1600, $g->source_folder_id),
-            'fallbackSrc' => 'https://lh3.googleusercontent.com/d/' . rawurlencode($sid) . '=w400',
-            'fallbackSrcLg' => 'https://lh3.googleusercontent.com/d/' . rawurlencode($sid) . '=w1600'
-        ];
+        ], $thumb_urls);
     }
 
     if ($meta_updated) {
@@ -2497,15 +2584,13 @@ function studio_api_client_get_gallery(WP_REST_Request $request) {
 
 function studio_format_client_photo_item($p, $folder_id) {
     $fid = $p['id'];
-    $is_demo = strpos($fid, 'demo') === 0;
-    return [
+    $thumb_link = (string) ($p['thumb_link'] ?? '');
+    $thumb_urls = studio_build_thumb_urls($fid, $thumb_link, $folder_id);
+
+    return array_merge([
         'id' => $fid,
         'name' => $p['name'],
-        'src' => $is_demo ? $p['thumb_link'] : studio_get_thumb_url($fid, 400, $folder_id),
-        'srcLg' => $is_demo ? $p['thumb_link'] : studio_get_thumb_url($fid, 1600, $folder_id),
-        'fallbackSrc' => $is_demo ? $p['thumb_link'] : ('https://lh3.googleusercontent.com/d/' . rawurlencode($fid) . '=w400'),
-        'fallbackSrcLg' => $is_demo ? $p['thumb_link'] : ('https://lh3.googleusercontent.com/d/' . rawurlencode($fid) . '=w1600')
-    ];
+    ], $thumb_urls);
 }
 
 function studio_api_client_get_photos(WP_REST_Request $request) {
@@ -2728,23 +2813,12 @@ add_action('init', function() {
         }
     }
 
-    $cdn_redirect_url = 'https://lh3.googleusercontent.com/d/' . rawurlencode($id) . '=w' . $w;
-    $fail_key = 'studio_thumbfail_' . $info['hash'];
-
-    // C5: Negative-cache 2 menit — langsung redirect 302 tanpa mengulang rantai
-    if (get_transient($fail_key)) {
-        while (ob_get_level()) ob_end_clean();
-        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-        header('Location: ' . $cdn_redirect_url, true, 302);
-        exit;
-    }
-
-    // C5: Lock per file (15 dtk) agar request paralel untuk gambar yang sama tidak menyerbu Google
+    $drive_thumb_url = 'https://drive.google.com/thumbnail?id=' . rawurlencode($id) . '&sz=w' . $w;
     $lock_key = 'studio_tlock_' . $info['hash'];
-    $lock_time = (int) get_option($lock_key, 0);
-    if ($lock_time && (time() - $lock_time) < 15) {
-        // Tunggu sebentar jika worker lain sedang mengunduh
-        for ($i = 0; $i < 4; $i++) {
+
+    // Lock ringan (8 dtk) berbasis transient agar request paralel untuk gambar yang sama menunggu proses pertama
+    if (get_transient($lock_key)) {
+        for ($i = 0; $i < 8; $i++) {
             usleep(250000);
             if (file_exists($info['path']) && filesize($info['path']) > 100) {
                 while (ob_get_level()) ob_end_clean();
@@ -2757,10 +2831,10 @@ add_action('init', function() {
         }
         while (ob_get_level()) ob_end_clean();
         header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-        header('Location: ' . $cdn_redirect_url, true, 302);
+        header('Location: ' . $drive_thumb_url, true, 302);
         exit;
     }
-    update_option($lock_key, time(), 'no');
+    set_transient($lock_key, 1, 8);
 
     $try_fetch_image = function($target_url) {
         if (empty($target_url)) return null;
@@ -2785,15 +2859,20 @@ add_action('init', function() {
         $id
     ));
     if (!empty($db_tlink)) {
-        $img_result = $try_fetch_image($db_tlink . '=s' . $w);
+        if (strpos($db_tlink, 'drive.google.com/thumbnail') !== false) {
+            $fetch_url = add_query_arg(['sz' => 'w' . $w], $db_tlink);
+        } else {
+            $fetch_url = preg_replace('/=[sw]\d+.*$/', '', $db_tlink) . '=s' . $w;
+        }
+        $img_result = $try_fetch_image($fetch_url);
     }
 
-    // Tier 2: lh3.googleusercontent.com/d/{id}=w{w}
+    // Tier 2: Google thumbnail endpoint resmi drive.google.com/thumbnail
     if (!$img_result) {
-        $img_result = $try_fetch_image($cdn_redirect_url);
+        $img_result = $try_fetch_image($drive_thumb_url);
     }
 
-    // Tier 3 & 4 hanya dicoba jika Tier 1 & 2 gagal
+    // Tier 3: Panggil Google Drive API files.get dengan API Key untuk menyegarkan thumbnailLink
     if (!$img_result && defined('STUDIO_GOOGLE_API_KEY') && !empty(STUDIO_GOOGLE_API_KEY)) {
         $meta_url = 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($id) . '?' . http_build_query([
             'fields' => 'id,name,thumbnailLink',
@@ -2815,11 +2894,12 @@ add_action('init', function() {
         }
     }
 
+    // Tier 4: lh3.googleusercontent.com/d/{id}=w{w}
     if (!$img_result) {
-        $img_result = $try_fetch_image("https://drive.google.com/thumbnail?id=" . rawurlencode($id) . "&sz=w{$w}");
+        $img_result = $try_fetch_image('https://lh3.googleusercontent.com/d/' . rawurlencode($id) . '=w' . $w);
     }
 
-    delete_option($lock_key);
+    delete_transient($lock_key);
 
     if ($img_result) {
         $body = $img_result['body'];
@@ -2841,10 +2921,9 @@ add_action('init', function() {
         exit;
     }
 
-    set_transient($fail_key, 1, 2 * MINUTE_IN_SECONDS);
     while (ob_get_level()) ob_end_clean();
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    header('Location: ' . $cdn_redirect_url, true, 302);
+    header('Location: ' . $drive_thumb_url, true, 302);
     exit;
 }, 1);
 

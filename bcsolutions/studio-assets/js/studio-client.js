@@ -330,10 +330,38 @@
     }
   }
 
-  // D2, D3, D7: Render grid sekali per mode tampilan, img native lazy + fetchpriority, 1x fallback + tombol retry per kartu
-  function attachCardImage(card, pItem, i) {
+  function getImageCandidates(pItem, isLg = false) {
+    const list = [];
+    const main = isLg ? (pItem.srcLg || pItem.src) : pItem.src;
+    const fallback = isLg ? (pItem.fallbackSrcLg || pItem.fallbackSrc) : pItem.fallbackSrc;
+    const fallbacksList = isLg ? (pItem.fallbacksLg || pItem.fallbacks) : pItem.fallbacks;
+
+    if (main) list.push(main);
+    if (Array.isArray(fallbacksList)) {
+      fallbacksList.forEach(u => {
+        if (u && !list.includes(u)) list.push(u);
+      });
+    }
+    if (fallback && !list.includes(fallback)) list.push(fallback);
+
+    if (!String(pItem.id).startsWith('demo')) {
+      const sz = isLg ? 1600 : 400;
+      const gThumb = `https://drive.google.com/thumbnail?id=${encodeURIComponent(pItem.id)}&sz=w${sz}`;
+      if (!list.includes(gThumb)) list.push(gThumb);
+    }
+    return list;
+  }
+
+  // D2, D3, D7: Render grid sekali per mode tampilan, img native lazy + fetchpriority, multi-candidate fallback
+  function attachCardImage(card, pItem, i, forceBust = false) {
     let img = card.querySelector('img');
     if (img) img.remove();
+
+    const candidates = getImageCandidates(pItem, false);
+    if (!candidates.length) {
+      card.classList.add('st-img-error');
+      return;
+    }
 
     img = document.createElement('img');
     img.width = 400;
@@ -349,20 +377,23 @@
       img.fetchPriority = 'low';
     }
 
+    let attempt = 0;
     img.onload = () => {
       card.classList.remove('st-img-error');
       card.classList.add('st-img-loaded');
     };
     img.onerror = () => {
-      const isDemo = String(pItem.id).startsWith('demo');
-      if (!isDemo && !img.dataset.fallbackTried && pItem.fallbackSrc && img.src !== pItem.fallbackSrc) {
-        img.dataset.fallbackTried = '1';
-        img.src = pItem.fallbackSrc;
+      attempt++;
+      if (attempt < candidates.length) {
+        const nextUrl = candidates[attempt];
+        img.src = forceBust ? (nextUrl + (nextUrl.includes('?') ? '&' : '?') + '_t=' + Date.now()) : nextUrl;
       } else {
         card.classList.add('st-img-error');
       }
     };
-    img.src = pItem.src;
+
+    const firstUrl = candidates[0];
+    img.src = forceBust ? (firstUrl + (firstUrl.includes('?') ? '&' : '?') + '_t=' + Date.now()) : firstUrl;
     card.prepend(img);
   }
 
@@ -465,16 +496,15 @@
     if (!p) return;
     const lbImg = $('st-lbimg');
     lbImg.referrerPolicy = 'no-referrer';
-    delete lbImg.dataset.fallbackTried;
+    const candidates = getImageCandidates(p, true);
+    let attempt = 0;
     lbImg.onerror = () => {
-      const isDemo = String(p.id).startsWith('demo');
-      const fb = p.fallbackSrcLg || `https://lh3.googleusercontent.com/d/${encodeURIComponent(p.id)}=w1600`;
-      if (!isDemo && !lbImg.dataset.fallbackTried && lbImg.src !== fb) {
-        lbImg.dataset.fallbackTried = '1';
-        lbImg.src = fb;
+      attempt++;
+      if (attempt < candidates.length) {
+        lbImg.src = candidates[attempt];
       }
     };
-    lbImg.src = p.srcLg || p.src;
+    lbImg.src = candidates[0] || p.srcLg || p.src;
     $('st-lbname').textContent = p.name;
     prefetchLbNeighbors();
 
@@ -525,7 +555,7 @@
         const list = inResultView ? resultPhotos : photos;
         if (list[idx]) {
           card.classList.remove('st-img-error');
-          attachCardImage(card, list[idx], idx);
+          attachCardImage(card, list[idx], idx, true);
         }
         return;
       }
